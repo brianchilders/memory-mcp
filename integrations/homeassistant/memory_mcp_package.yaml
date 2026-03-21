@@ -1,0 +1,446 @@
+# memory_mcp_package.yaml — Home Assistant integration package for memory-mcp
+#
+# INSTALLATION
+# ────────────
+# 1. Copy this file to your HA config/packages/ directory.
+#    If you don't have a packages/ folder, create it and add this to configuration.yaml:
+#      homeassistant:
+#        packages: !include_dir_named packages
+#
+# 2. Edit the CONFIGURATION section below — set your memory-mcp host and bearer token.
+#
+# 3. Edit ENTITY IDs in the automations to match your actual HA entities.
+#    Search for "# ← CHANGE" comments.
+#
+# 4. Reload HA (Developer Tools → YAML → Reload All YAML), or restart.
+#
+# WHAT THIS DOES
+# ──────────────
+# rest_command:  HTTP wrappers for every memory-mcp endpoint
+# automation:    Pushes presence, temperature, climate, and daily summaries
+#                automatically whenever HA sensors change
+# script:        Reusable helpers — store a memory, query context, etc.
+# sensor:        Template sensors showing memory-mcp health stats on dashboards
+#
+# MQTT ALTERNATIVE
+# ────────────────
+# If you already run Mosquitto, the MQTT bridge (integrations/mqtt_bridge.py)
+# is simpler than rest_commands for high-frequency sensors — one automation
+# per sensor type instead of one rest_command per endpoint.
+# See integrations/README.md for details.
+
+# ── CONFIGURATION ──────────────────────────────────────────────────────────────
+#
+# STEP 1 — Set your host URL
+#   Every rest_command URL in this file contains the placeholder:
+#     http://memory-mcp.local:8900
+#   Do a find-and-replace across this entire file:
+#     Find:    memory-mcp.local:8900
+#     Replace: <your-actual-host-and-port>   e.g. 192.168.1.42:8900
+#
+# STEP 2 — Store your bearer token in secrets.yaml
+#   Add this line to /config/secrets.yaml (include the "Bearer " prefix):
+#     memory_mcp_auth_header: "Bearer your-token-here"
+#   Retrieve the token from http://<host>:8900/admin/settings
+#   The Authorization headers in this file already reference !secret memory_mcp_auth_header.
+#
+# STEP 3 — Update entity IDs
+#   Search for "# ← CHANGE" comments and replace each entity_id with your
+#   actual HA entity.  Find entity IDs at Developer Tools → States.
+#
+# STEP 4 — Reload
+#   Developer Tools → YAML → Reload All YAML
+#
+# ── HOST PLACEHOLDER ───────────────────────────────────────────────────────────
+# All URLs below use:  http://memory-mcp.local:8900
+# Replace this string with your actual host (see STEP 1 above).
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+# ── REST COMMANDS ──────────────────────────────────────────────────────────────
+# Every memory-mcp endpoint exposed as an HA rest_command.
+# Call these from automations, scripts, or the Developer Tools Services panel.
+
+rest_command:
+
+  # ── Time-series: push a sensor reading ───────────────────────────────────────
+  memory_record:
+    url: "http://memory-mcp.local:8900/record"       # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+    payload: >-
+      {
+        "entity_name": "{{ entity_name }}",
+        "metric":      "{{ metric }}",
+        "value":       {{ value }},
+        "unit":        "{{ unit | default('') }}",
+        "source":      "{{ source | default('ha') }}",
+        "entity_type": "{{ entity_type | default('person') }}"
+      }
+
+  # ── Semantic memory: store a fact ─────────────────────────────────────────────
+  memory_remember:
+    url: "http://memory-mcp.local:8900/remember"     # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+    payload: >-
+      {
+        "entity_name": "{{ entity_name }}",
+        "fact":        "{{ fact }}",
+        "category":    "{{ category | default('general') }}",
+        "confidence":  {{ confidence | default(1.0) }},
+        "source":      "{{ source | default('ha') }}",
+        "entity_type": "{{ entity_type | default('person') }}"
+      }
+
+  # ── Semantic search ───────────────────────────────────────────────────────────
+  memory_recall:
+    url: "http://memory-mcp.local:8900/recall"       # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+    payload: >-
+      {
+        "query":       "{{ query }}",
+        "entity_name": "{{ entity_name | default('') }}",
+        "top_k":       {{ top_k | default(5) }}
+      }
+
+  # ── Context snapshot (preferred for AI ability use) ───────────────────────────
+  memory_get_context:
+    url: "http://memory-mcp.local:8900/get_context"  # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+    payload: >-
+      {
+        "entity_name":    "{{ entity_name }}",
+        "context_query":  "{{ context_query }}",
+        "max_facts":      {{ max_facts | default(5) }}
+      }
+
+  # ── Bulk readings (efficient for batch pushes) ────────────────────────────────
+  memory_record_bulk:
+    url: "http://memory-mcp.local:8900/record/bulk"  # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+    payload: "{{ readings_json }}"
+
+  # ── Prune old raw readings ────────────────────────────────────────────────────
+  memory_prune:
+    url: "http://memory-mcp.local:8900/prune"        # ← CHANGE HOST
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: !secret memory_mcp_auth_header
+
+
+# ── AUTOMATIONS ────────────────────────────────────────────────────────────────
+
+automation:
+
+  # ── Presence: push person state changes ──────────────────────────────────────
+  - id: memory_mcp_presence_brian
+    alias: "memory-mcp: push Brian's presence"
+    description: >
+      Records home/away/not_home state changes for Brian as categorical readings.
+      After enough data the pattern engine will learn his typical schedule.
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: person.brian                      # ← CHANGE to your person entity
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "Brian"                       # ← CHANGE to match your entity name in memory-mcp
+          metric:      "presence"
+          value:       '"{{ trigger.to_state.state }}"'
+          source:      "ha"
+          entity_type: "person"
+
+  # ── Temperature: push room temperature changes ────────────────────────────────
+  # Duplicate this block for each room sensor.
+  - id: memory_mcp_temp_living_room
+    alias: "memory-mcp: push living room temperature"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: sensor.living_room_temperature    # ← CHANGE to your sensor
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state | float(-999) > -999 }}"
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "living_room"
+          metric:      "temperature"
+          value:       "{{ trigger.to_state.state | float }}"
+          unit:        "F"                           # ← or "C"
+          source:      "ha"
+          entity_type: "room"
+
+  - id: memory_mcp_temp_bedroom
+    alias: "memory-mcp: push bedroom temperature"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: sensor.bedroom_temperature        # ← CHANGE to your sensor
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state | float(-999) > -999 }}"
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "bedroom"
+          metric:      "temperature"
+          value:       "{{ trigger.to_state.state | float }}"
+          unit:        "F"
+          source:      "ha"
+          entity_type: "room"
+
+  # ── Humidity ──────────────────────────────────────────────────────────────────
+  - id: memory_mcp_humidity_living_room
+    alias: "memory-mcp: push living room humidity"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: sensor.living_room_humidity       # ← CHANGE
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state | float(-999) > -999 }}"
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "living_room"
+          metric:      "humidity"
+          value:       "{{ trigger.to_state.state | float }}"
+          unit:        "%"
+          source:      "ha"
+          entity_type: "room"
+
+  # ── Climate: thermostat setpoint changes ──────────────────────────────────────
+  - id: memory_mcp_thermostat_setpoint
+    alias: "memory-mcp: push thermostat setpoint changes"
+    description: >
+      Tracks manual thermostat adjustments as preferences.
+      Over time the pattern engine will learn preferred temperatures per room.
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: climate.living_room               # ← CHANGE to your climate entity
+        attribute: temperature
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "living_room"
+          metric:      "thermostat_setpoint"
+          value:       "{{ state_attr('climate.living_room', 'temperature') | float }}"  # ← CHANGE
+          unit:        "F"
+          source:      "ha"
+          entity_type: "room"
+
+  # ── HVAC mode changes ─────────────────────────────────────────────────────────
+  - id: memory_mcp_hvac_mode
+    alias: "memory-mcp: push HVAC mode"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: climate.living_room               # ← CHANGE
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "living_room"
+          metric:      "hvac_mode"
+          value:       '"{{ trigger.to_state.state }}"'
+          source:      "ha"
+          entity_type: "room"
+
+  # ── Door / window sensors ─────────────────────────────────────────────────────
+  - id: memory_mcp_front_door
+    alias: "memory-mcp: push front door state"
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door          # ← CHANGE
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "front_door"
+          metric:      "state"
+          value:       '"{{ trigger.to_state.state }}"'
+          source:      "ha"
+          entity_type: "device"
+
+  # ── Energy monitoring ─────────────────────────────────────────────────────────
+  - id: memory_mcp_energy_hourly
+    alias: "memory-mcp: push hourly energy consumption"
+    description: >
+      Pushes whole-home energy usage every hour.  Useful for detecting patterns
+      like high consumption when presence=home at specific hours.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        hours: "/1"   # every hour
+    action:
+      - service: rest_command.memory_record
+        data:
+          entity_name: "home"
+          metric:      "energy_consumption"
+          value:       "{{ states('sensor.whole_home_power') | float(0) }}"  # ← CHANGE
+          unit:        "W"
+          source:      "ha"
+          entity_type: "house"
+
+  # ── Daily summary: push a structured snapshot every morning ───────────────────
+  - id: memory_mcp_daily_summary
+    alias: "memory-mcp: push daily home summary"
+    description: >
+      Every morning at 06:00, stores a composite snapshot of current home state
+      as a semantic memory.  This gives AI abilities a natural-language summary
+      they can recall for "what was happening around this time" queries.
+    mode: single
+    trigger:
+      - platform: time
+        at: "06:00:00"
+    action:
+      - service: rest_command.memory_remember
+        data:
+          entity_name: "home"
+          fact: >-
+            Morning snapshot {{ now().strftime('%Y-%m-%d') }}:
+            living room {{ states('sensor.living_room_temperature') }}°F,
+            Brian is {{ states('person.brian') }},
+            thermostat set to {{ state_attr('climate.living_room', 'temperature') }}°F.
+          category: "routine"
+          confidence: 1.0
+          source:      "ha_daily_summary"
+          entity_type: "house"
+
+  # ── Startup: verify connectivity and log a fact ───────────────────────────────
+  - id: memory_mcp_ha_startup
+    alias: "memory-mcp: log HA startup"
+    description: >
+      Stores a fact when HA starts or restarts so you can see restart history
+      in the memory timeline.
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:30"   # wait for integrations to settle
+      - service: rest_command.memory_remember
+        data:
+          entity_name: "home"
+          fact:         "Home Assistant started at {{ now().strftime('%Y-%m-%d %H:%M') }}"
+          category:     "general"
+          confidence:   1.0
+          source:       "ha"
+          entity_type:  "house"
+
+
+# ── SCRIPTS ────────────────────────────────────────────────────────────────────
+# Reusable helpers you can call from the Services panel, voice assistants,
+# Lovelace buttons, or other automations.
+
+script:
+
+  memory_store_preference:
+    alias: "Store a preference in memory-mcp"
+    description: >
+      Stores a preference fact for a person.
+      Useful for quick manual entry from the Developer Tools Services panel.
+    fields:
+      person:
+        description: "Person name (must match entity name in memory-mcp)"
+        example: "Brian"
+      preference:
+        description: "What the person prefers"
+        example: "Prefers the bedroom at 66°F when sleeping"
+    sequence:
+      - service: rest_command.memory_remember
+        data:
+          entity_name: "{{ person }}"
+          fact:        "{{ preference }}"
+          category:    "preference"
+          confidence:  0.95
+          source:      "ha_manual"
+          entity_type: "person"
+
+  memory_store_observation:
+    alias: "Store an observation in memory-mcp"
+    description: >
+      Store any free-text fact about a person, room, or device.
+    fields:
+      entity_name:
+        description: "Entity name in memory-mcp"
+        example: "living_room"
+      observation:
+        description: "The fact to store"
+        example: "Air quality was poor during the wildfire smoke event"
+      category:
+        description: "Category: general, preference, habit, insight"
+        example: "general"
+    sequence:
+      - service: rest_command.memory_remember
+        data:
+          entity_name: "{{ entity_name }}"
+          fact:        "{{ observation }}"
+          category:    "{{ category | default('general') }}"
+          confidence:  0.90
+          source:      "ha_manual"
+
+  memory_prune_old_readings:
+    alias: "Prune old memory-mcp readings"
+    description: >
+      Deletes raw readings older than RETENTION_DAYS (default 30 days).
+      Safe to run at any time — rollups and memories are never deleted.
+    sequence:
+      - service: rest_command.memory_prune
+
+
+# ── SENSORS ────────────────────────────────────────────────────────────────────
+# Template sensors that expose memory-mcp health stats on your dashboard.
+# Requires HA 2022.6+ for template sensor platform syntax.
+
+template:
+  - sensor:
+      - name: "memory-mcp status"
+        unique_id: memory_mcp_status
+        icon: mdi:brain
+        state: >
+          {% set url = "http://memory-mcp.local:8900/health" %}
+          {{ "online" if now() else "unknown" }}
+        # For a real live status, use a RESTful sensor (see below).
+        # This template sensor is a placeholder — replace with the rest sensor below.
+
+# ── RESTful sensor (live health stats) ─────────────────────────────────────────
+# Uncomment and configure to pull live entity/memory/reading counts from memory-mcp.
+# Requires the 'rest' integration (enabled by default in HA).
+
+# sensor:
+#   - platform: rest
+#     name: "memory-mcp health"
+#     resource: "http://memory-mcp.local:8900/health"   # ← CHANGE HOST
+#     headers:
+#       Authorization: !secret memory_mcp_auth_header
+#     value_template: "{{ value_json.status }}"
+#     scan_interval: 60
+#     json_attributes:
+#       - entities
+#       - memories
+#       - readings
+#       - ts

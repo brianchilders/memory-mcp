@@ -1,0 +1,47 @@
+{
+  "_comment": "Copy this file to mqtt_mappings.json and edit to match your devices.",
+
+  "zigbee2mqtt/living_room_sensor": {
+    "entity": "living_room",
+    "entity_type": "room",
+    "metrics": {
+      "temperature": {"unit": "F"},
+      "humidity":    {"unit": "%"},
+      "occupancy":   {},
+      "co2":         {"unit": "ppm"}
+    }
+  },
+
+  "zigbee2mqtt/bedroom_sensor": {
+    "entity": "bedroom",
+    "entity_type": "room",
+    "metrics": {
+      "temperature": {"unit": "F"},
+      "humidity":    {"unit": "%"}
+    }
+  },
+
+  "zigbee2mqtt/office_sensor": {
+    "entity": "office",
+    "entity_type": "room",
+    "metrics": {
+      "temperature": {"unit": "F"},
+      "humidity":    {"unit": "%"},
+      "illuminance": {"unit": "lux"}
+    }
+  },
+
+  "homeassistant/sensor/brian_presence/state": {
+    "_comment": "HA state topics publish a bare string like 'home' or 'away'",
+    "entity": "Brian",
+    "entity_type": "person",
+    "scalar_metric": "presence"
+  },
+
+  "homeassistant/sensor/thermostat_setpoint/state": {
+    "entity": "living_room",
+    "entity_type": "room",
+    "scalar_metric": "thermostat_setpoint",
+    "unit": "F"
+  }
+}

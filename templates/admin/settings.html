@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <h4 class="mb-0">Settings</h4>
+</div>
+
+<div class="row g-4">
+
+  <!-- API Authentication -->
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>API Authentication</span>
+        {% if auth_enabled %}
+          <span class="badge bg-success">Enabled</span>
+        {% else %}
+          <span class="badge bg-danger">Disabled</span>
+        {% endif %}
+      </div>
+      <div class="card-body">
+
+        {% if not auth_enabled %}
+        <div class="alert alert-danger">
+          <strong>No API token configured.</strong>
+          The HTTP API is open — any caller can read and write data.
+          A token was generated on startup but may not have been saved.
+          Restart the server and copy the token from the logs, or regenerate below.
+        </div>
+        {% endif %}
+
+        {% if token_source == "env" %}
+        <div class="alert alert-info mb-3">
+          Token is controlled by the <code>MEMORY_API_TOKEN</code> environment variable.
+          It cannot be regenerated from the UI — update the env var in your deployment config.
+        </div>
+        {% endif %}
+
+        <!-- Current token display -->
+        {% if token %}
+        <div class="mb-3">
+          <label class="form-label fw-semibold">Current token</label>
+          <div class="input-group">
+            <input type="password" id="token-field" class="form-control font-monospace"
+                   value="{{ token }}" readonly>
+            <button class="btn btn-outline-secondary" type="button"
+                    onclick="toggleToken(this)">Show</button>
+            <button class="btn btn-outline-secondary" type="button"
+                    onclick="copyToken()">Copy</button>
+          </div>
+          <div class="form-text">
+            {% if token_source == "env" %}
+              Source: <code>MEMORY_API_TOKEN</code> environment variable
+            {% else %}
+              Source: database — can be regenerated below
+            {% endif %}
+          </div>
+        </div>
+        {% endif %}
+
+        <!-- Regenerate button -->
+        <div class="mt-3">
+          <button class="btn btn-warning {% if token_source == 'env' %}disabled{% endif %}"
+                  {% if token_source != 'env' %}
+                  hx-post="/admin/token/regenerate"
+                  hx-target="#regen-result"
+                  hx-swap="innerHTML"
+                  hx-confirm="Generate a new token? All existing API clients will need updating."
+                  {% endif %}>
+            Regenerate token
+          </button>
+          {% if token_source == "env" %}
+          <span class="text-muted ms-2 small">Disabled — token is set via env var</span>
+          {% endif %}
+        </div>
+        <div id="regen-result"></div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- How to use the token -->
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header">How to use the token</div>
+      <div class="card-body">
+        <p class="small text-muted mb-2">Include in every API request:</p>
+        <pre class="bg-light p-2 rounded small">curl -X POST http://localhost:8900/remember \
+  -H "Authorization: Bearer &lt;token&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{...}'</pre>
+
+        <p class="small text-muted mb-2 mt-3">In a <code>.env</code> file:</p>
+        <pre class="bg-light p-2 rounded small">MEMORY_API_TOKEN=&lt;token&gt;</pre>
+
+        <p class="small text-muted mb-2 mt-3">Exempt from auth (no token needed):</p>
+        <ul class="small mb-0">
+          <li><code>GET /health</code> — monitoring</li>
+          <li><code>/admin/*</code> — this UI</li>
+          <li><code>/docs</code> — Swagger UI</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header">Quick links</div>
+      <div class="card-body p-0">
+        <div class="list-group list-group-flush">
+          <a href="/docs" class="list-group-item list-group-item-action py-2 small">
+            API docs (Swagger) →
+          </a>
+          <a href="/health" class="list-group-item list-group-item-action py-2 small">
+            Health check →
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function toggleToken(btn) {
+  const f = document.getElementById('token-field');
+  if (f.type === 'password') {
+    f.type = 'text';
+    btn.textContent = 'Hide';
+  } else {
+    f.type = 'password';
+    btn.textContent = 'Show';
+  }
+}
+function copyToken() {
+  const val = document.getElementById('token-field').value;
+  navigator.clipboard.writeText(val).then(() => {
+    const btn = event.target;
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = orig, 2000);
+  });
+}
+</script>
+{% endblock %}

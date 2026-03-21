@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Entities{% endblock %}
+
+{% block content %}
+<h4 class="mb-3">Entities <span class="badge bg-secondary fs-6">{{ entities|length }}</span></h4>
+
+{% if entities %}
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Memories</th>
+          <th>Readings</th>
+          <th>Meta</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for e in entities %}
+        <tr>
+          <td>
+            <a href="/admin/entity/{{ e.name }}" class="fw-semibold text-decoration-none">
+              {{ e.name }}
+            </a>
+          </td>
+          <td><span class="badge bg-light text-dark border">{{ e.type }}</span></td>
+          <td>{{ e.mem_count }}</td>
+          <td>{{ e.reading_count }}</td>
+          <td class="text-muted small">
+            {% if e.meta %}
+              {% for k, v in e.meta.items() %}
+                <span class="me-1"><strong>{{ k }}</strong>={{ v }}</span>
+              {% endfor %}
+            {% else %}—{% endif %}
+          </td>
+          <td class="text-muted small">{{ e.updated }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info">No entities yet. Use <code>remember</code> or <code>record</code> to create them.</div>
+{% endif %}
+{% endblock %}

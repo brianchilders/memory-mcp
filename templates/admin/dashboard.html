@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">Dashboard</h4>
+  <small class="text-muted">{{ now }}</small>
+</div>
+
+<!-- Stats row -->
+<div class="row g-3 mb-4">
+  {% for label, key, color in [
+      ("Entities",  "entities",  "primary"),
+      ("Memories",  "memories",  "success"),
+      ("Readings",  "readings",  "warning"),
+      ("Rollups",   "rollups",   "info"),
+      ("Patterns",  "patterns",  "secondary"),
+      ("Schedules", "schedules", "dark"),
+  ] %}
+  <div class="col-6 col-md-4 col-xl-2">
+    <div class="card stat-card border-{{ color }} h-100">
+      <div class="card-body py-3">
+        <div class="stat-number text-{{ color }}">{{ stats[key] }}</div>
+        <div class="text-muted small">{{ label }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Reading age row -->
+<div class="row g-3 mb-4">
+  <div class="col-md-6">
+    <div class="card h-100">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-2 text-muted">Reading window</h6>
+        <div class="d-flex justify-content-between">
+          <span><strong>Oldest:</strong> {{ stats.oldest_reading }}</span>
+          <span><strong>Newest:</strong> {{ stats.newest_reading }}</span>
+        </div>
+        <hr class="my-2">
+        <div class="d-flex align-items-center gap-3">
+          <span class="text-muted small">Retention policy: {{ retention_days }} days</span>
+          <button class="btn btn-sm btn-outline-danger"
+                  hx-post="/admin/prune"
+                  hx-target="#prune-result"
+                  hx-swap="innerHTML">
+            Prune old readings
+          </button>
+        </div>
+        <div id="prune-result"></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card h-100">
+      <div class="card-body">
+        <h6 class="card-subtitle mb-2 text-muted">Quick links</h6>
+        <div class="list-group list-group-flush">
+          <a href="/admin/entities" class="list-group-item list-group-item-action py-1">
+            Browse all entities →
+          </a>
+          <a href="/admin/readings" class="list-group-item list-group-item-action py-1">
+            Recent readings stream →
+          </a>
+          <a href="/docs" class="list-group-item list-group-item-action py-1">
+            API docs (Swagger) →
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recent activity -->
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between">
+        <span>Recent memories</span>
+        <a href="/admin/entities" class="small text-muted">see all →</a>
+      </div>
+      <div class="card-body p-0">
+        {% if recent_memories %}
+        <table class="table table-sm table-hover mb-0">
+          <thead class="table-light">
+            <tr><th>Entity</th><th>Category</th><th>Fact</th><th>Updated</th></tr>
+          </thead>
+          <tbody>
+          {% for m in recent_memories %}
+            <tr>
+              <td><a href="/admin/entity/{{ m.entity }}">{{ m.entity }}</a></td>
+              <td><span class="badge bg-secondary badge-category">{{ m.category }}</span></td>
+              <td class="text-truncate" style="max-width:200px" title="{{ m.fact }}">{{ m.fact }}</td>
+              <td class="text-muted small">{{ m.updated }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="text-muted m-3">No memories stored yet.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header">Recent promoted patterns</div>
+      <div class="card-body p-0">
+        {% if recent_patterns %}
+        <table class="table table-sm table-hover mb-0">
+          <thead class="table-light">
+            <tr><th>Entity</th><th>Metric</th><th>Pattern key</th><th>Detected</th></tr>
+          </thead>
+          <tbody>
+          {% for p in recent_patterns %}
+            <tr>
+              <td><a href="/admin/entity/{{ p.entity }}">{{ p.entity }}</a></td>
+              <td>{{ p.metric }}</td>
+              <td><code class="small">{{ p.pattern_key }}</code></td>
+              <td class="text-muted small">{{ p.detected }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="text-muted m-3">No patterns promoted yet. The pattern engine runs hourly.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

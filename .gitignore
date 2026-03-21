@@ -1,0 +1,37 @@
+# Environment and secrets — never commit
+.env
+*.env
+
+# Database — contains personal data
+*.db
+*.db-wal
+*.db-shm
+
+# MQTT device mappings — may contain personal device names/topics
+# (commit mqtt_mappings.example.json, not your real one)
+integrations/mqtt_mappings.json
+
+# Developer/maintainer docs — personal infrastructure references, not for public repo
+docs/DEVELOPMENT.md
+
+# Claude Code local settings — personal permissions and hooks
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Docker
+docker-compose.override.yml
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

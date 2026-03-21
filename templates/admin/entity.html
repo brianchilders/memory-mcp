@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}{{ name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center gap-2 mb-3">
+  <a href="/admin/entities" class="text-muted text-decoration-none">← Entities</a>
+  <span class="text-muted">/</span>
+  <h4 class="mb-0">{{ name }}</h4>
+  <span class="badge bg-light text-dark border">{{ entity_type }}</span>
+</div>
+
+<div class="row g-3">
+
+  <!-- Left column -->
+  <div class="col-lg-8">
+
+    <!-- Meta -->
+    {% if meta %}
+    <div class="card mb-3">
+      <div class="card-header">Attributes (meta)</div>
+      <div class="card-body py-2">
+        <dl class="row mb-0">
+          {% for k, v in meta.items() %}
+          <dt class="col-sm-3">{{ k }}</dt>
+          <dd class="col-sm-9">{{ v }}</dd>
+          {% endfor %}
+        </dl>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Memories by category -->
+    {% if memories_by_cat %}
+    <div class="card mb-3">
+      <div class="card-header">Memories</div>
+      <div class="card-body p-0">
+        {% for category, mems in memories_by_cat.items() %}
+        <div class="px-3 pt-3">
+          <span class="badge bg-secondary mb-1">{{ category }}</span>
+        </div>
+        <ul class="list-group list-group-flush">
+          {% for m in mems %}
+          <li class="list-group-item py-2{% if m.superseded %} list-group-item-secondary{% endif %}">
+            <div class="d-flex justify-content-between align-items-start">
+              <pre class="fact flex-grow-1 me-2{% if m.superseded %} text-decoration-line-through text-muted{% endif %}">{{ m.fact }}</pre>
+              <div class="text-end text-muted small" style="min-width:110px">
+                {% if m.superseded %}
+                <span class="badge bg-secondary mb-1">superseded</span><br>
+                {% elif m.confidence < 1.0 %}
+                <span class="badge bg-warning text-dark mb-1">{{ "%.0f"|format(m.confidence * 100) }}%</span><br>
+                {% endif %}
+                {{ m.updated }}
+              </div>
+            </div>
+            {% if m.source %}
+            <small class="text-muted">source: {{ m.source }}</small>
+            {% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="alert alert-light">No memories stored for {{ name }}.</div>
+    {% endif %}
+
+    <!-- Promoted patterns -->
+    {% if patterns %}
+    <div class="card mb-3">
+      <div class="card-header">Promoted patterns</div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead class="table-light">
+            <tr><th>Metric</th><th>Pattern key</th><th>Fact</th></tr>
+          </thead>
+          <tbody>
+          {% for p in patterns %}
+            <tr>
+              <td>{{ p.metric }}</td>
+              <td><code class="small">{{ p.pattern_key }}</code></td>
+              <td class="small">{{ p.fact }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Recent readings -->
+    {% if recent_readings %}
+    <div class="card mb-3">
+      <div class="card-header">Recent readings (last 50)</div>
+      <div class="card-body p-0">
+        <table class="table table-sm reading-row mb-0">
+          <thead class="table-light">
+            <tr><th>Metric</th><th>Value</th><th>Timestamp</th></tr>
+          </thead>
+          <tbody>
+          {% for r in recent_readings %}
+            <tr>
+              <td>{{ r.metric }}</td>
+              <td><code>{{ r.value }}</code></td>
+              <td class="text-muted">{{ r.ts }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
+  </div>
+
+  <!-- Right column -->
+  <div class="col-lg-4">
+
+    <!-- Relationships -->
+    {% if relations %}
+    <div class="card mb-3">
+      <div class="card-header">Relationships</div>
+      <ul class="list-group list-group-flush">
+        {% for r in relations %}
+        <li class="list-group-item d-flex justify-content-between">
+          <span class="badge bg-info text-dark">{{ r.rel_type }}</span>
+          <a href="/admin/entity/{{ r.other }}">{{ r.other }}</a>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <!-- Latest readings per metric -->
+    {% if latest_readings %}
+    <div class="card mb-3">
+      <div class="card-header">Latest readings</div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead class="table-light">
+            <tr><th>Metric</th><th>Value</th><th>At</th></tr>
+          </thead>
+          <tbody>
+          {% for r in latest_readings %}
+            <tr>
+              <td>{{ r.metric }}</td>
+              <td><code>{{ r.value }}</code></td>
+              <td class="text-muted small">{{ r.ts }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Upcoming schedule -->
+    {% if upcoming %}
+    <div class="card mb-3">
+      <div class="card-header">Upcoming schedule</div>
+      <ul class="list-group list-group-flush">
+        {% for ev in upcoming %}
+        <li class="list-group-item">
+          <div class="fw-semibold">{{ ev.title }}</div>
+          <div class="text-muted small">{{ ev.start }}</div>
+          {% if ev.recurrence != "none" %}
+          <span class="badge bg-secondary badge-category">{{ ev.recurrence }}</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+  </div>
+</div>
+{% endblock %}

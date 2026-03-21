@@ -1,0 +1,360 @@
+"""
+api.py — FastAPI HTTP wrapper for the memory-mcp-server.
+
+Exposes every MCP tool as a REST endpoint so non-MCP callers
+(Home Assistant webhooks, Node-RED, shell scripts, etc.) can
+push readings and query memories over plain HTTP.
+
+Install extra dep:
+    pip install fastapi uvicorn
+
+Run:
+    python api.py
+    # or with auto-reload during dev:
+    uvicorn api:app --host 0.0.0.0 --port 8900 --reload
+
+Endpoints mirror MCP tool names:
+    POST /remember          POST /record
+    POST /recall            POST /query_stream
+    GET  /profile/{name}    POST /get_trends
+    POST /relate            POST /schedule
+    POST /forget            POST /cross_query
+    GET  /entities          GET  /health
+"""
+
+import asyncio
+import time
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse
+
+# All business logic lives in server.py — no duplication
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import server as mem
+from admin import router as admin_router
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mem.setup_logging()
+    mem.init_db()
+    asyncio.create_task(mem.pattern_engine_loop())
+    yield
+
+
+app = FastAPI(
+    title="Memory MCP — HTTP API",
+    description="Persistent semantic memory + time-series for OpenHome abilities.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# ── CORS ───────────────────────────────────────────────────────────────────────
+# MEMORY_CORS_ORIGINS — comma-separated list of allowed origins, or "*" (default)
+# Examples:
+#   MEMORY_CORS_ORIGINS=*
+#   MEMORY_CORS_ORIGINS=http://homeassistant.local,http://localhost:3000
+
+_cors_raw = mem.os.environ.get("MEMORY_CORS_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Bearer token authentication ────────────────────────────────────────────────
+# Paths that bypass auth (monitoring + admin UI + API docs)
+_AUTH_EXEMPT = ("/health", "/admin", "/docs", "/openapi", "/redoc")
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Require 'Authorization: Bearer <token>' on all API endpoints.
+
+    Exemptions (no token needed):
+      /health        — uptime monitoring
+      /admin/*       — admin UI (protect at network layer instead)
+      /docs, /redoc  — Swagger / ReDoc UI
+      /openapi.json  — OpenAPI schema
+
+    Auth is disabled entirely when no token is configured (MEMORY_API_TOKEN not set
+    and no token in the database). In that case all requests pass through.
+    """
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        for prefix in _AUTH_EXEMPT:
+            if request.url.path.startswith(prefix):
+                return await call_next(request)
+
+        expected = mem.get_api_token()
+        if not expected:
+            return await call_next(request)  # auth disabled
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                {"ok": False, "error": "Missing Authorization: Bearer <token> header"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if auth_header[7:] != expected:
+            mem.log.warning("Auth failure from %s", request.client.host if request.client else "unknown")
+            return JSONResponse(
+                {"ok": False, "error": "Invalid bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+app.include_router(admin_router)
+
+
+# ── Request / response models ──────────────────────────────────────────────────
+
+class RememberRequest(BaseModel):
+    entity_name: str
+    fact: str
+    entity_type: str = "person"
+    category: str = "general"
+    confidence: float = 1.0
+    source: str | None = None
+    meta: dict | None = None
+
+class RecallRequest(BaseModel):
+    query: str
+    entity_name: str | None = None
+    category: str | None = None
+    top_k: int = 5
+    recency_weight: float = 0.0
+    min_confidence: float = 0.0
+
+class GetContextRequest(BaseModel):
+    entity_name: str
+    context_query: str
+    max_facts: int = 5
+
+class RelateRequest(BaseModel):
+    entity_a: str
+    entity_b: str
+    rel_type: str
+    meta: dict | None = None
+
+class UnrelateRequest(BaseModel):
+    entity_a: str
+    entity_b: str
+    rel_type: str
+
+class ForgetRequest(BaseModel):
+    entity_name: str
+    memory_id: int | None = None
+
+class RecordRequest(BaseModel):
+    entity_name: str
+    metric: str
+    value: Any = Field(description="float (numeric), str (categorical), or dict (composite)")
+    unit: str | None = None
+    source: str | None = None
+    entity_type: str = "person"
+    ts: float | None = None
+
+class QueryStreamRequest(BaseModel):
+    entity_name: str
+    metric: str
+    start_ts: float | None = None
+    end_ts: float | None = None
+    granularity: str = "raw"    # 'raw' | 'hour' | 'day' | 'week'
+    limit: int = 100
+
+class TrendsRequest(BaseModel):
+    entity_name: str
+    metric: str
+    window: str = "week"        # 'day' | 'week' | 'month'
+
+class ScheduleRequest(BaseModel):
+    entity_name: str
+    title: str
+    start_ts: float
+    end_ts: float | None = None
+    recurrence: str = "none"
+    meta: dict | None = None
+    entity_type: str = "person"
+
+class CrossQueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+# ── Helper: wrap any coroutine and surface errors as HTTP 500 ──────────────────
+
+async def run(coro):
+    try:
+        result = await coro
+        return {"result": result, "ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Health + introspection ─────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """Quick liveness check — also returns entity count."""
+    db = mem.get_db()
+    n_entities = db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    n_memories = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    n_readings = db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+    db.close()
+    return {
+        "status": "ok",
+        "entities": n_entities,
+        "memories": n_memories,
+        "readings": n_readings,
+        "ts": time.time(),
+    }
+
+
+@app.get("/entities")
+async def list_entities():
+    """List all known entities with type and meta."""
+    db = mem.get_db()
+    rows = db.execute("SELECT name, type, meta, updated FROM entities ORDER BY name").fetchall()
+    db.close()
+    return {
+        "entities": [
+            {"name": r["name"], "type": r["type"],
+             "meta": __import__("json").loads(r["meta"]),
+             "updated": r["updated"]}
+            for r in rows
+        ]
+    }
+
+
+# ── Tier 1 — Semantic memory endpoints ────────────────────────────────────────
+
+@app.post("/remember")
+async def remember(req: RememberRequest):
+    return await run(mem.tool_remember(**req.model_dump()))
+
+
+@app.post("/recall")
+async def recall(req: RecallRequest):
+    return await run(mem.tool_recall(**req.model_dump()))
+
+
+@app.post("/get_context")
+async def get_context(req: GetContextRequest):
+    return await run(mem.tool_get_context(**req.model_dump()))
+
+
+@app.get("/profile/{entity_name}")
+async def get_profile(entity_name: str):
+    return await run(mem.tool_get_profile(entity_name))
+
+
+@app.post("/relate")
+async def relate(req: RelateRequest):
+    return await run(mem.tool_relate(**req.model_dump()))
+
+
+@app.post("/unrelate")
+async def unrelate(req: UnrelateRequest):
+    return await run(mem.tool_unrelate(**req.model_dump()))
+
+
+@app.post("/forget")
+async def forget(req: ForgetRequest):
+    return await run(mem.tool_forget(**req.model_dump()))
+
+
+# ── Tier 2 — Time-series endpoints ────────────────────────────────────────────
+
+@app.post("/record")
+async def record(req: RecordRequest):
+    """
+    Ingest a single time-series reading.
+
+    Designed for high-frequency callers — Home Assistant automations,
+    Node-RED flows, cron jobs, etc.
+
+    Example (curl):
+        curl -X POST http://localhost:8900/record \\
+             -H 'Content-Type: application/json' \\
+             -d '{"entity_name":"living_room","metric":"temperature","value":71.4,"unit":"F","source":"ha","entity_type":"room"}'
+    """
+    return await run(mem.tool_record(**req.model_dump()))
+
+
+@app.post("/query_stream")
+async def query_stream(req: QueryStreamRequest):
+    return await run(mem.tool_query_stream(**req.model_dump()))
+
+
+@app.post("/get_trends")
+async def get_trends(req: TrendsRequest):
+    return await run(mem.tool_get_trends(**req.model_dump()))
+
+
+@app.post("/schedule")
+async def schedule(req: ScheduleRequest):
+    return await run(mem.tool_schedule(**req.model_dump()))
+
+
+# ── Cross-tier ─────────────────────────────────────────────────────────────────
+
+@app.post("/cross_query")
+async def cross_query(req: CrossQueryRequest):
+    return await run(mem.tool_cross_query(**req.model_dump()))
+
+
+# ── Maintenance ─────────────────────────────────────────────────────────────────
+
+@app.post("/prune")
+async def prune():
+    """
+    Delete raw readings older than RETENTION_DAYS (default 30 days).
+    Rollups and memories are not affected.
+    """
+    return await run(mem.tool_prune())
+
+
+# ── Convenience: bulk record (for batch sensor pushes) ────────────────────────
+
+class BulkRecordRequest(BaseModel):
+    readings: list[RecordRequest]
+
+@app.post("/record/bulk")
+async def record_bulk(req: BulkRecordRequest):
+    """
+    Ingest multiple readings in one request.
+    Useful for Home Assistant batch webhooks or IoT gateways.
+    """
+    results = []
+    for r in req.readings:
+        try:
+            result = await mem.tool_record(**r.model_dump())
+            results.append({"ok": True, "result": result})
+        except Exception as e:
+            results.append({"ok": False, "error": str(e)})
+    return {"results": results, "count": len(results)}
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api:app", host="0.0.0.0", port=8900, reload=False)

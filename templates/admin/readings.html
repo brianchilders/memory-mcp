@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Readings{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">
+    Readings stream
+    <span class="badge bg-secondary fs-6">{{ total }}</span>
+  </h4>
+  <div class="d-flex align-items-center gap-3">
+    <span class="text-muted small">Oldest: {{ oldest }}</span>
+    <button class="btn btn-sm btn-outline-danger"
+            hx-post="/admin/prune"
+            hx-target="#prune-result"
+            hx-swap="innerHTML">
+      Prune older than {{ retention_days }}d
+    </button>
+  </div>
+</div>
+<div id="prune-result" class="mb-2"></div>
+
+<!-- Limit selector -->
+<div class="d-flex gap-2 mb-3 align-items-center">
+  <span class="text-muted small">Show:</span>
+  {% for n in [50, 100, 500] %}
+  <a href="/admin/readings?limit={{ n }}"
+     class="btn btn-sm {% if limit == n %}btn-primary{% else %}btn-outline-secondary{% endif %}">
+    {{ n }}
+  </a>
+  {% endfor %}
+</div>
+
+{% if readings %}
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-sm table-hover mb-0 reading-row">
+      <thead class="table-light">
+        <tr>
+          <th>Timestamp</th>
+          <th>Entity</th>
+          <th>Metric</th>
+          <th>Value</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in readings %}
+        <tr>
+          <td class="text-muted">{{ r.ts }}</td>
+          <td>
+            <a href="/admin/entity/{{ r.entity }}" class="text-decoration-none">{{ r.entity }}</a>
+          </td>
+          <td>{{ r.metric }}</td>
+          <td><code>{{ r.value }}</code></td>
+          <td class="text-muted">{{ r.source }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info">No readings recorded yet.</div>
+{% endif %}
+{% endblock %}
