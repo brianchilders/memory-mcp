@@ -40,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import server as mem
 from admin import router as admin_router
+from voice_routes import router as voice_router
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(AuthMiddleware)
 
 app.include_router(admin_router)
+app.include_router(voice_router)
 
 
 # ── Request / response models ──────────────────────────────────────────────────

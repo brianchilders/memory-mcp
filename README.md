@@ -22,6 +22,7 @@ that any ability can recall semantically (Tier 1).
 | `server.py`       | MCP server (stdio transport, all 11 tools)           |
 | `api.py`          | FastAPI HTTP wrapper + admin UI mount                |
 | `admin.py`        | Admin UI router (served at `/admin`)                 |
+| `voice_routes.py` | Speaker identity API (`/voices/*` — enroll, merge, update voiceprints) |
 | `reembed.py`      | Utility to re-embed all memories when swapping models|
 | `templates/admin` | Jinja2 HTML templates for the admin UI               |
 | `integrations/`   | Standalone tools that connect external systems to memory-mcp via HTTP |
@@ -93,7 +94,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (285 tests, no Ollama needed)
+python -m pytest                     # full suite (308 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -211,6 +212,11 @@ POST /get_trends                trend summary
 POST /schedule                  add schedule event
 POST /cross_query               unified search
 POST /prune                     delete readings older than RETENTION_DAYS
+
+GET  /voices/unknown            list unenrolled provisional speaker entities
+POST /voices/enroll             rename provisional entity to real person
+POST /voices/merge              merge provisional entity into enrolled entity
+POST /voices/update_print       update voiceprint embedding (running average)
 
 GET  /admin/                    dashboard
 GET  /admin/entities            entity list

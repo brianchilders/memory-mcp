@@ -15,13 +15,11 @@ Liveness check. Returns row counts for all tables.
 **Response:**
 ```json
 {
-  "ok": true,
+  "status": "ok",
   "entities": 3,
   "memories": 47,
   "readings": 12840,
-  "rollups": 210,
-  "patterns": 8,
-  "schedule_events": 2
+  "ts": 1711123456.78
 }
 ```
 
@@ -450,18 +448,175 @@ See `docs/admin-ui.md` for a full guide.
 
 ---
 
+## Voice — Speaker Identity
+
+Routes for managing voiceprint-based speaker enrollment. Voiceprints are stored
+in the entity `meta` JSON column — no schema changes required. Provisional
+entities are created by the pipeline worker with name `unknown_voice_{hash}` and
+`meta.status = "unenrolled"`.
+
+All voice routes require the standard `Authorization: Bearer <token>` header.
+
+### `GET /voices/unknown`
+
+List all provisional (unenrolled) speaker entities, ordered by detection count descending.
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | `20` | Maximum results |
+| `min_detections` | int | `1` | Exclude entities seen fewer than this many times |
+
+**Response:**
+```json
+{
+  "result": [
+    {
+      "entity_name": "unknown_voice_a3f2c8d1",
+      "first_seen": "2026-03-22T10:30:00Z",
+      "first_seen_room": "kitchen",
+      "detection_count": 7,
+      "last_seen": 1742644500.0,
+      "sample_transcript": "I need to pick up groceries tomorrow"
+    }
+  ],
+  "ok": true
+}
+```
+
+`last_seen` and `sample_transcript` come from the entity's most recent
+`voice_activity` reading. Both are `null` if no voice readings have been recorded.
+
+---
+
+### `POST /voices/enroll`
+
+Rename a provisional entity to a real person's name and mark it enrolled.
+All existing memories, readings, and relations remain attached — only the
+entity name and `meta.status` change.
+
+**Request:**
+```json
+{
+  "entity_name":  "unknown_voice_a3f2c8d1",
+  "new_name":     "Brian",
+  "display_name": "Brian Childers"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `entity_name` | string | yes | Current provisional name |
+| `new_name` | string | yes | Real name to assign |
+| `display_name` | string | no | Human-readable name stored in meta |
+
+**Response:**
+```json
+{
+  "result": {
+    "entity_id": 42,
+    "entity_name": "Brian",
+    "previous_name": "unknown_voice_a3f2c8d1",
+    "memories_transferred": 14,
+    "readings_transferred": 7
+  },
+  "ok": true
+}
+```
+
+**Errors:** `404` if `entity_name` not found; `409` if `new_name` already exists.
+
+---
+
+### `POST /voices/merge`
+
+Merge a provisional entity into an existing enrolled entity. Transfers all
+memories, readings, and active relations to the target; averages voiceprint
+embeddings weighted by sample count; then deletes the source entity.
+
+Runs as a single atomic transaction. Relations that conflict with a UNIQUE
+constraint on the target are skipped — they are removed by CASCADE when the
+source entity is deleted.
+
+**Request:**
+```json
+{
+  "source_name": "unknown_voice_a3f2c8d1",
+  "target_name": "Brian"
+}
+```
+
+**Response:**
+```json
+{
+  "result": {
+    "target_name": "Brian",
+    "memories_merged": 6,
+    "readings_merged": 12,
+    "relations_merged": 2,
+    "source_deleted": "unknown_voice_a3f2c8d1"
+  },
+  "ok": true
+}
+```
+
+**Errors:** `400` if source and target are the same entity; `404` if either entity not found.
+
+---
+
+### `POST /voices/update_print`
+
+Update the voiceprint embedding for an entity using a running weighted average.
+Called by the pipeline worker after each confident speaker identification to
+refine the embedding over time. Result is re-normalized to a unit vector.
+
+**Request:**
+```json
+{
+  "entity_name": "Brian",
+  "embedding":   [0.012, -0.034, "... 256 values total ..."],
+  "weight":      0.1
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `entity_name` | string | yes | Enrolled entity name |
+| `embedding` | float[256] | yes | New resemblyzer embedding (must be finite — no NaN/Infinity) |
+| `weight` | float | no (default `0.1`) | Contribution of new sample; range 0.0–1.0 |
+
+**Response:**
+```json
+{
+  "result": {
+    "entity_name": "Brian",
+    "voiceprint_samples": 13,
+    "embedding_norm": 1.0
+  },
+  "ok": true
+}
+```
+
+`embedding_norm` should be ~1.0 after normalization — a sanity check for the caller.
+
+**Errors:** `404` if entity not found; `422` if embedding is not 256-dimensional or contains non-finite values.
+
+---
+
 ## Error responses
 
-All endpoints return `{"ok": false, "error": "..."}` on failure with an appropriate
-HTTP status code:
+All endpoints return a JSON error body with an appropriate HTTP status code.
+
+**Format:**
+```json
+{"detail": "Entity 'Brian' not found"}
+```
 
 | Status | Meaning |
 |---|---|
-| `400` | Bad request — missing required field or invalid value |
+| `400` | Bad request — invalid combination of parameters |
 | `404` | Entity or memory not found |
+| `409` | Conflict — target name already exists |
+| `422` | Validation error — missing required field, wrong type, or invalid value |
 | `500` | Server error — check logs for details |
-
-Example error:
-```json
-{"ok": false, "error": "Entity 'Brian' not found"}
-```

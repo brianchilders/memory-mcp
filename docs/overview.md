@@ -257,7 +257,7 @@ When you first clone and run memory-mcp, you get:
   admin settings page
 - **Docker Compose** for single-command production deployment:
   `docker compose up -d`
-- Full test suite (285 tests, no Ollama or internet connection required to run)
+- Full test suite (308 tests, no Ollama or internet connection required to run)
 - Comprehensive documentation covering every aspect of installation, operation,
   and extension
 

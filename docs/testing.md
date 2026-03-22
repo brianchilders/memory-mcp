@@ -38,6 +38,7 @@ python -m pytest --tb=short
 | `tests/test_retention.py` | _prune_readings and tool_prune — boundary conditions, cascade safety |
 | `tests/test_api.py` | All FastAPI HTTP endpoints including /prune |
 | `tests/test_admin.py` | Admin UI smoke tests — route 200s, key HTML fragments present |
+| `tests/test_voice_routes.py` | Voice identity routes — GET /voices/unknown, enroll, merge (including voiceprint math), update_print, self-merge guard, NaN/Infinity rejection |
 
 ## Fixture design
 
