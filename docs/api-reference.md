@@ -448,6 +448,112 @@ See `docs/admin-ui.md` for a full guide.
 
 ---
 
+## Episodic Memory
+
+### `POST /open_session`
+
+Open a new conversation session for an entity. Creates the entity if it does not exist.
+
+**Request:**
+```json
+{"entity_name": "Brian", "entity_type": "person"}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entity_name` | string | yes | — | Entity to attach the session to |
+| `entity_type` | string | no | `"person"` | Used only when creating a new entity |
+
+**Response:** `{"result": 42, "ok": true}` — `result` is the integer `session_id`. Pass it to `/log_turn`, `/close_session`, and `/get_session`.
+
+---
+
+### `POST /log_turn`
+
+Append one turn to an open session.
+
+**Request:**
+```json
+{"session_id": 42, "role": "user", "content": "I need to pick up groceries tomorrow"}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `session_id` | int | yes | Session to append to |
+| `role` | string | yes | Must be `"user"`, `"assistant"`, or `"system"` |
+| `content` | string | yes | Turn content |
+
+**Response:** `{"result": "Logged [user] turn to session 42.", "ok": true}`
+
+**Note:** If `session_id` does not exist the tool returns a descriptive error string in `result` with HTTP 200 — consistent with all other tool-wrapping routes.
+
+**Error:** `422` if `role` is not one of the three allowed values.
+
+---
+
+### `POST /close_session`
+
+Close a session and optionally store a summary. Sets `ended_at` to now; session becomes read-only.
+
+**Request:**
+```json
+{"session_id": 42, "summary": "Brian discussed grocery shopping and meal planning."}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `session_id` | int | yes | Session to close |
+| `summary` | string | no | Optional summary; omit or `null` to close without one |
+
+**Response:** `{"result": "Closed session 42. Summary: '...'", "ok": true}`
+
+---
+
+### `GET /get_session/{session_id}`
+
+Retrieve a full session transcript: all turns in order, entity name, open/close times, and summary.
+
+**Response:**
+```json
+{
+  "result": "Session 42 — Brian | 2026-03-22 10:30 → 2026-03-22 10:45\nSummary: Brian discussed grocery shopping.\n\n  [10:30:01] user: I need to pick up groceries\n  [10:30:05] assistant: I'll remind you tomorrow.",
+  "ok": true
+}
+```
+
+If `session_id` does not exist, returns a descriptive string in `result` with HTTP 200.
+
+---
+
+## LLM Extraction
+
+### `POST /extract_and_remember`
+
+Extract structured facts from free text using the configured LLM and store them as Tier 1 memories for the entity.
+
+**Request:**
+```json
+{
+  "entity_name": "Brian",
+  "text":        "I prefer dark roast coffee and usually wake up at 6am",
+  "entity_type": "person",
+  "model":       null
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entity_name` | string | yes | — | Entity to store facts for |
+| `text` | string | yes | — | Free text to extract facts from |
+| `entity_type` | string | no | `"person"` | Used only when creating a new entity |
+| `model` | string | no | `null` | LLM model override; defaults to `MEMORY_LLM_MODEL` env var |
+
+**Response:** `{"result": "Extracted and stored 2 fact(s) for 'Brian'.", "ok": true}`
+
+**Note:** Requires a running Ollama instance (or configured LLM backend). If the LLM is unavailable, the tool catches the exception and returns `"result": "Extraction failed: ..."` with HTTP 200 — it does not raise a 500.
+
+---
+
 ## Voice — Speaker Identity
 
 Routes for managing voiceprint-based speaker enrollment. Voiceprints are stored

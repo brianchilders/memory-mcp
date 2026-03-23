@@ -94,7 +94,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (308 tests, no Ollama needed)
+python -m pytest                     # full suite (336 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -212,6 +212,12 @@ POST /get_trends                trend summary
 POST /schedule                  add schedule event
 POST /cross_query               unified search
 POST /prune                     delete readings older than RETENTION_DAYS
+
+POST /open_session              open a conversation session for an entity
+POST /log_turn                  append a turn (user/assistant/system) to a session
+POST /close_session             close a session with optional summary
+GET  /get_session/{id}          retrieve full session transcript
+POST /extract_and_remember      LLM-extract facts from text and store as memories
 
 GET  /voices/unknown            list unenrolled provisional speaker entities
 POST /voices/enroll             rename provisional entity to real person

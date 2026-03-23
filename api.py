@@ -200,6 +200,25 @@ class CrossQueryRequest(BaseModel):
     query: str
     top_k: int = 5
 
+class OpenSessionRequest(BaseModel):
+    entity_name: str
+    entity_type: str = "person"
+
+class LogTurnRequest(BaseModel):
+    session_id: int
+    role: str = Field(..., pattern="^(user|assistant|system)$")
+    content: str
+
+class CloseSessionRequest(BaseModel):
+    session_id: int
+    summary: str | None = None
+
+class ExtractAndRememberRequest(BaseModel):
+    entity_name: str
+    text: str
+    entity_type: str = "person"
+    model: str | None = None
+
 
 # ── Helper: wrap any coroutine and surface errors as HTTP 500 ──────────────────
 
@@ -281,6 +300,38 @@ async def unrelate(req: UnrelateRequest):
 @app.post("/forget")
 async def forget(req: ForgetRequest):
     return await run(mem.tool_forget(**req.model_dump()))
+
+
+# ── Tier 1.5 — Episodic memory endpoints ──────────────────────────────────────
+
+@app.post("/open_session")
+async def open_session(req: OpenSessionRequest):
+    """Open a new conversation session for an entity. Returns session_id (int)."""
+    return await run(mem.tool_open_session(**req.model_dump()))
+
+
+@app.post("/log_turn")
+async def log_turn(req: LogTurnRequest):
+    """Append a turn to an open session. role: 'user' | 'assistant' | 'system'."""
+    return await run(mem.tool_log_turn(**req.model_dump()))
+
+
+@app.post("/close_session")
+async def close_session(req: CloseSessionRequest):
+    """Close a session and optionally store a summary."""
+    return await run(mem.tool_close_session(**req.model_dump()))
+
+
+@app.get("/get_session/{session_id}")
+async def get_session(session_id: int):
+    """Retrieve a session transcript with all turns, entity name, and summary."""
+    return await run(mem.tool_get_session(session_id))
+
+
+@app.post("/extract_and_remember")
+async def extract_and_remember(req: ExtractAndRememberRequest):
+    """Extract facts from text via LLM and store them as memories for the entity."""
+    return await run(mem.tool_extract_and_remember(**req.model_dump()))
 
 
 # ── Tier 2 — Time-series endpoints ────────────────────────────────────────────
