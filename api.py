@@ -24,6 +24,8 @@ Endpoints mirror MCP tool names:
 
 import asyncio
 import time
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -32,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 # All business logic lives in server.py — no duplication
 import sys
@@ -44,10 +46,41 @@ from voice_routes import router as voice_router
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
+async def _probe_ollama() -> None:
+    """
+    Probe the configured AI base URL at startup and log the result.
+
+    Uses the OpenAI-compatible /models endpoint — works with Ollama, LM Studio,
+    and vLLM. Runs in a thread so it doesn't block the async event loop.
+    Failure is a warning, not an error — the server starts regardless.
+    """
+    base = mem.os.environ.get("MEMORY_AI_BASE_URL", "http://localhost:11434/v1")
+    probe_url = base.rstrip("/") + "/models"
+
+    def _check() -> tuple[bool, str]:
+        try:
+            urllib.request.urlopen(probe_url, timeout=3)
+            return True, ""
+        except urllib.error.URLError as exc:
+            return False, str(exc.reason)
+        except Exception as exc:
+            return False, str(exc)
+
+    ok, reason = await asyncio.to_thread(_check)
+    if ok:
+        mem.log.info("AI backend reachable at %s", base)
+    else:
+        mem.log.warning(
+            "AI backend NOT reachable at %s — embedding and LLM calls will fail until it is (%s)",
+            base, reason,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     mem.setup_logging()
     mem.init_db()
+    await _probe_ollama()
     asyncio.create_task(mem.pattern_engine_loop())
     yield
 
@@ -77,7 +110,7 @@ app.add_middleware(
 
 # ── Bearer token authentication ────────────────────────────────────────────────
 # Paths that bypass auth (monitoring + admin UI + API docs)
-_AUTH_EXEMPT = ("/health", "/admin", "/docs", "/openapi", "/redoc")
+_AUTH_EXEMPT = ("/health", "/admin", "/docs", "/openapi", "/redoc", "/favicon.ico")
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -228,6 +261,22 @@ async def run(coro):
         return {"result": result, "ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Favicon ────────────────────────────────────────────────────────────────────
+
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="6" fill="#4f46e5"/>'
+    '<text x="16" y="23" font-size="18" font-family="sans-serif" '
+    'font-weight="bold" text-anchor="middle" fill="white">M</text>'
+    "</svg>"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
 
 
 # ── Health + introspection ─────────────────────────────────────────────────────
