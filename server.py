@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -104,6 +105,60 @@ if _raw:
 
 DECAY_CONFIDENCE_FLOOR = 0.05
 DECAY_RECALL_BOOST     = 0.05   # confidence nudge applied when a memory is recalled
+
+# ── Source trust tiers ─────────────────────────────────────────────────────────
+#
+# Every stored memory carries a source_trust integer (1–5) indicating how much
+# weight to give its origin.  Higher numbers win in conflict resolution and
+# contribute more strongly to recall ranking.
+#
+# Tiers (in descending order of trust):
+#   TRUST_USER     = 5  — explicit user assertion; the authority on their own data
+#   TRUST_HARDWARE = 4  — sensor / device measurement (smartwatch, scale, etc.)
+#   TRUST_SYSTEM   = 3  — structured API (calendar, smart home hub, health app)
+#   TRUST_INFERRED = 2  — LLM extraction, pattern engine promotion
+#   TRUST_EXTERNAL = 1  — third-party import, scraped content
+#
+# Conflict resolution rule: an incoming memory whose source_trust is LOWER than
+# the existing contradicting memory's source_trust will NOT supersede it.
+# Equal or higher trust → supersede (existing behaviour: newer wins on ties).
+#
+# Recall scoring: score = sim × recency × confidence × (trust / TRUST_USER)
+# At tier 5 the multiplier is 1.0 (no change). At tier 1 it is 0.2.
+#
+# Configurable defaults per ingestion path (env vars):
+#   MEMORY_TRUST_DEFAULT_REMEMBER = 5  (tool_remember, POST /remember, admin UI)
+#   MEMORY_TRUST_DEFAULT_EXTRACT  = 2  (extract_and_remember)
+#   MEMORY_TRUST_DEFAULT_PATTERN  = 2  (pattern engine promoted insights)
+#   MEMORY_TRUST_DEFAULT_IMPORT   = 1  (all importers)
+
+TRUST_USER     = 5
+TRUST_HARDWARE = 4
+TRUST_SYSTEM   = 3
+TRUST_INFERRED = 2
+TRUST_EXTERNAL = 1
+
+TRUST_NAMES: dict[int, str] = {
+    TRUST_USER:     "user",
+    TRUST_HARDWARE: "hardware",
+    TRUST_SYSTEM:   "system",
+    TRUST_INFERRED: "inferred",
+    TRUST_EXTERNAL: "external",
+}
+TRUST_BY_NAME: dict[str, int] = {v: k for k, v in TRUST_NAMES.items()}
+
+def _parse_trust_env(var: str, default: int) -> int:
+    raw = os.environ.get(var, "")
+    if raw.strip().isdigit():
+        return max(TRUST_EXTERNAL, min(TRUST_USER, int(raw)))
+    if raw.strip().lower() in TRUST_BY_NAME:
+        return TRUST_BY_NAME[raw.strip().lower()]
+    return default
+
+TRUST_DEFAULT_REMEMBER: int = _parse_trust_env("MEMORY_TRUST_DEFAULT_REMEMBER", TRUST_USER)
+TRUST_DEFAULT_EXTRACT:  int = _parse_trust_env("MEMORY_TRUST_DEFAULT_EXTRACT",  TRUST_INFERRED)
+TRUST_DEFAULT_PATTERN:  int = _parse_trust_env("MEMORY_TRUST_DEFAULT_PATTERN",  TRUST_INFERRED)
+TRUST_DEFAULT_IMPORT:   int = _parse_trust_env("MEMORY_TRUST_DEFAULT_IMPORT",   TRUST_EXTERNAL)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 #
@@ -330,6 +385,62 @@ def init_db():
         value  TEXT NOT NULL
     );
 
+    -- ══════════════════════════════════════════════════════════════════════════
+    -- Working memory — task-scoped transient scratchpad (Tier 1.75)
+    -- ══════════════════════════════════════════════════════════════════════════
+
+    -- A named task or goal scope for transient agent state.
+    -- status: 'open' | 'closed' | 'expired'
+    -- ttl_ts: auto-expire at this unix timestamp (NULL = no expiry)
+    CREATE TABLE IF NOT EXISTS working_memory_tasks (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        entity_id   INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+        status      TEXT NOT NULL DEFAULT 'open',
+        ttl_ts      REAL,
+        created     REAL NOT NULL,
+        closed_at   REAL
+    );
+
+    -- Key/value scratchpad slots attached to a task.
+    -- value is stored as JSON so any scalar/list/dict is round-trippable.
+    CREATE TABLE IF NOT EXISTS working_memory_slots (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id     INTEGER NOT NULL REFERENCES working_memory_tasks(id) ON DELETE CASCADE,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        created     REAL NOT NULL,
+        updated     REAL NOT NULL,
+        UNIQUE(task_id, key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wm_tasks_status ON working_memory_tasks(status, created);
+    CREATE INDEX IF NOT EXISTS idx_wm_tasks_entity ON working_memory_tasks(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_wm_slots_task   ON working_memory_slots(task_id);
+
+    -- ══════════════════════════════════════════════════════════════════════════
+    -- Prospective / intention memory (Tier 4)
+    -- ══════════════════════════════════════════════════════════════════════════
+
+    -- Condition-based future intentions: "next time X happens, do Y."
+    -- trigger_text : natural-language condition ("Brian mentions being tired")
+    -- action_text  : what to do when triggered ("suggest taking a rest break")
+    -- expires_ts   : NULL = never expire
+    -- active       : 1=watching, 0=dismissed
+    CREATE TABLE IF NOT EXISTS intentions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id    INTEGER REFERENCES entities(id) ON DELETE CASCADE,
+        trigger_text TEXT NOT NULL,
+        action_text  TEXT NOT NULL,
+        expires_ts   REAL,
+        fired_count  INTEGER NOT NULL DEFAULT 0,
+        last_fired   REAL,
+        created      REAL NOT NULL,
+        active       INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_intentions_entity ON intentions(entity_id, active);
+
     CREATE INDEX IF NOT EXISTS idx_readings_entity_metric ON readings(entity_id, metric);
     CREATE INDEX IF NOT EXISTS idx_readings_ts            ON readings(ts);
     CREATE INDEX IF NOT EXISTS idx_rollups_bucket         ON reading_rollups(entity_id, metric, bucket_type, bucket_ts);
@@ -346,6 +457,78 @@ def init_db():
         f"CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0("
         f"embedding FLOAT[{EMBED_DIM}])"
     )
+
+    # ── FTS5 keyword indexes ────────────────────────────────────────────────────
+    # External-content FTS5 tables — the real data stays in the base tables;
+    # FTS5 stores only the index.  Triggers (below) keep the index in sync.
+    # porter unicode61 tokenizer: case-fold + Porter stemming ("storing"→"store").
+
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts "
+        "USING fts5(fact, content='memories', content_rowid='id', "
+        "tokenize='porter unicode61')"
+    )
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS session_turns_fts "
+        "USING fts5(content, content='session_turns', content_rowid='id', "
+        "tokenize='porter unicode61')"
+    )
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS intentions_fts "
+        "USING fts5(trigger_text, content='intentions', content_rowid='id', "
+        "tokenize='porter unicode61')"
+    )
+
+    # Triggers cannot live inside executescript() because BEGIN…END bodies
+    # contain semicolons that break the simple statement splitter.
+    for _sql in [
+        # memories_fts — keep in sync with memories table
+        """CREATE TRIGGER IF NOT EXISTS memories_fts_ai
+           AFTER INSERT ON memories BEGIN
+               INSERT INTO memories_fts(rowid, fact) VALUES (new.id, new.fact);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS memories_fts_ad
+           AFTER DELETE ON memories BEGIN
+               INSERT INTO memories_fts(memories_fts, rowid, fact)
+               VALUES ('delete', old.id, old.fact);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS memories_fts_au
+           AFTER UPDATE ON memories BEGIN
+               INSERT INTO memories_fts(memories_fts, rowid, fact)
+               VALUES ('delete', old.id, old.fact);
+               INSERT INTO memories_fts(rowid, fact) VALUES (new.id, new.fact);
+           END""",
+        # session_turns_fts — turns are immutable so only insert/delete needed
+        """CREATE TRIGGER IF NOT EXISTS session_turns_fts_ai
+           AFTER INSERT ON session_turns BEGIN
+               INSERT INTO session_turns_fts(rowid, content) VALUES (new.id, new.content);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS session_turns_fts_ad
+           AFTER DELETE ON session_turns BEGIN
+               INSERT INTO session_turns_fts(session_turns_fts, rowid, content)
+               VALUES ('delete', old.id, old.content);
+           END""",
+        # intentions_fts — keep in sync with intentions table
+        """CREATE TRIGGER IF NOT EXISTS intentions_fts_ai
+           AFTER INSERT ON intentions BEGIN
+               INSERT INTO intentions_fts(rowid, trigger_text)
+               VALUES (new.id, new.trigger_text);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS intentions_fts_ad
+           AFTER DELETE ON intentions BEGIN
+               INSERT INTO intentions_fts(intentions_fts, rowid, trigger_text)
+               VALUES ('delete', old.id, old.trigger_text);
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS intentions_fts_au
+           AFTER UPDATE ON intentions BEGIN
+               INSERT INTO intentions_fts(intentions_fts, rowid, trigger_text)
+               VALUES ('delete', old.id, old.trigger_text);
+               INSERT INTO intentions_fts(rowid, trigger_text)
+               VALUES (new.id, new.trigger_text);
+           END""",
+    ]:
+        db.execute(_sql)
+
     db.commit()
     # Checkpoint WAL on startup so the WAL file doesn't grow unbounded
     db.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -363,12 +546,38 @@ def _apply_migrations():
         "ALTER TABLE memories ADD COLUMN superseded_by INTEGER REFERENCES memories(id)",
         "ALTER TABLE relations ADD COLUMN valid_from REAL",
         "ALTER TABLE relations ADD COLUMN valid_until REAL",
+        # Source trust tier (1=external … 5=user).  Existing rows default to
+        # TRUST_USER (5) — they were all entered via the API or MCP tool.
+        f"ALTER TABLE memories ADD COLUMN source_trust INTEGER NOT NULL DEFAULT {TRUST_USER}",
+        # Episodic consolidation: tracks whether a session has been processed by
+        # the background consolidation pass.
+        "ALTER TABLE sessions ADD COLUMN consolidated INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             db.execute(sql)
         except sqlite3.OperationalError:
             pass   # column already exists
     db.commit()
+
+    # ── One-time FTS backfill ─────────────────────────────────────────────────
+    # Populate FTS indexes from existing rows if not yet done.
+    # Uses a config key so this only runs once per installation.
+    done = db.execute(
+        "SELECT value FROM config WHERE key='fts_backfill_v1'"
+    ).fetchone()
+    if not done:
+        db.execute(
+            "INSERT INTO memories_fts(rowid, fact) SELECT id, fact FROM memories"
+        )
+        db.execute(
+            "INSERT INTO session_turns_fts(rowid, content)"
+            " SELECT id, content FROM session_turns"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO config(key, value) VALUES ('fts_backfill_v1', '1')"
+        )
+        db.commit()
+
     db.close()
 
 
@@ -602,6 +811,30 @@ def _age_label(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
+# ── FTS helpers ────────────────────────────────────────────────────────────────
+
+_FTS_STRIP_RE = re.compile(r'["\'\-\*\^\(\)\\:\.!?,;/|]+')
+
+def _fts_query(raw: str) -> str:
+    """
+    Convert a natural-language string to a safe FTS5 MATCH query.
+
+    Strips FTS5 operator characters and joins tokens with OR so that
+    any matching term returns a result (bag-of-words OR, porter-stemmed).
+    Single-character tokens are dropped to reduce noise.
+    OR semantics are correct here: when searching for "PostgreSQL database"
+    we want facts mentioning either concept, not requiring both.
+    """
+    safe   = _FTS_STRIP_RE.sub(' ', raw)
+    tokens = [t for t in safe.split() if len(t) >= 2]
+    return ' OR '.join(tokens)  # empty string when no usable tokens
+
+
+def _est_tokens(text: str) -> int:
+    """Estimate token count: 1 token ≈ 4 characters (GPT-style heuristic)."""
+    return max(1, len(text) // 4)
+
+
 # ── Tier 1 — Semantic memory tools ────────────────────────────────────────────
 
 async def tool_remember(
@@ -611,38 +844,90 @@ async def tool_remember(
     category: str = "general",
     confidence: float = 1.0,
     source: str | None = None,
+    source_trust: int | None = None,
     meta: dict | None = None,
 ) -> str:
+    """
+    source_trust: 1–5 integer tier (TRUST_EXTERNAL … TRUST_USER).
+    Defaults to TRUST_DEFAULT_REMEMBER (env: MEMORY_TRUST_DEFAULT_REMEMBER, default 5).
+    Lower-trust facts will NOT supersede higher-trust contradicting memories.
+    """
+    trust = max(TRUST_EXTERNAL, min(TRUST_USER, int(source_trust))) \
+        if source_trust is not None else TRUST_DEFAULT_REMEMBER
+
+    dist_threshold = 1.0 - CONTRADICTION_THRESHOLD
+
     db = get_db()
     now = time.time()
     eid = upsert_entity(db, entity_name, entity_type, meta)
+
+    # ── Pre-write cross-check (Feature 4) ─────────────────────────────────────
+    # If this fact's trust is STRICTLY lower than an existing similar fact,
+    # reject the write entirely rather than letting a conflicting low-trust
+    # fact accumulate in the DB alongside the high-trust truth.
+    #
+    # Only applied for sub-user-trust writes (TRUST_USER always wins through).
+    # The check runs BEFORE the INSERT so no partial state is written.
+    if trust < TRUST_USER:
+        vec_pre = await embed(fact)
+        existing_row = db.execute(
+            "SELECT id FROM entities WHERE name=?", (entity_name,)
+        ).fetchone()
+        if existing_row:
+            blocking = db.execute(
+                """SELECT m.fact, m.source_trust FROM memory_vectors v
+                   JOIN memories m ON m.id=v.rowid
+                   WHERE m.entity_id=? AND m.superseded_by IS NULL
+                     AND m.source_trust > ?
+                     AND vec_distance_cosine(v.embedding, ?) < ?
+                   LIMIT 1""",
+                (existing_row["id"], trust, vec_blob(vec_pre), dist_threshold),
+            ).fetchone()
+            if blocking:
+                db.close()
+                trust_label = TRUST_NAMES.get(trust, str(trust))
+                block_label = TRUST_NAMES.get(blocking["source_trust"],
+                                               str(blocking["source_trust"]))
+                return (
+                    f"Write blocked [trust={trust_label}]: contradicts a higher-trust "
+                    f"({block_label}) memory — {blocking['fact']!r}"
+                )
+
     cur = db.execute(
-        "INSERT INTO memories(entity_id,fact,category,confidence,source,created,updated) VALUES(?,?,?,?,?,?,?)",
-        (eid, fact, category, confidence, source, now, now),
+        """INSERT INTO memories
+               (entity_id, fact, category, confidence, source, source_trust, created, updated)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (eid, fact, category, confidence, source, trust, now, now),
     )
     mid = cur.lastrowid
     vec = await embed(fact)
     db.execute("INSERT INTO memory_vectors(rowid,embedding) VALUES(?,?)", (mid, vec_blob(vec)))
 
     # Contradiction detection: supersede existing memories that are semantically
-    # similar (cosine distance < 1 - CONTRADICTION_THRESHOLD) for the same entity.
-    # The new memory wins; older ones are marked superseded_by = new mid.
-    dist_threshold = 1.0 - CONTRADICTION_THRESHOLD
+    # similar (cosine distance < 1 − CONTRADICTION_THRESHOLD) for the same entity.
+    # Trust rule: the incoming memory supersedes only if its trust >= existing trust.
+    # This prevents low-trust sources (scraped data, imports) from overwriting
+    # facts that were explicitly asserted by the user or measured by a sensor.
     similar = db.execute(
-        """SELECT m.id FROM memory_vectors v
+        """SELECT m.id, m.source_trust FROM memory_vectors v
            JOIN memories m ON m.id=v.rowid
            WHERE m.entity_id=? AND m.id != ? AND m.superseded_by IS NULL
              AND vec_distance_cosine(v.embedding, ?) < ?""",
         (eid, mid, vec_blob(vec), dist_threshold),
     ).fetchall()
+
+    superseded = 0
     for s in similar:
-        db.execute("UPDATE memories SET superseded_by=? WHERE id=?", (mid, s["id"]))
+        if trust >= s["source_trust"]:
+            db.execute("UPDATE memories SET superseded_by=? WHERE id=?", (mid, s["id"]))
+            superseded += 1
 
     db.commit(); db.close()
-    if similar:
-        return (f"Remembered [{category}] for {entity_name!r}: {fact!r} "
-                f"(superseded {len(similar)} similar memory/memories)")
-    return f"Remembered [{category}] for {entity_name!r}: {fact!r}"
+    trust_label = TRUST_NAMES.get(trust, str(trust))
+    if superseded:
+        return (f"Remembered [{category}, trust={trust_label}] for {entity_name!r}: {fact!r} "
+                f"(superseded {superseded} similar memory/memories)")
+    return f"Remembered [{category}, trust={trust_label}] for {entity_name!r}: {fact!r}"
 
 
 async def tool_recall(
@@ -652,69 +937,139 @@ async def tool_recall(
     top_k: int = TOP_K_DEFAULT,
     recency_weight: float = 0.0,
     min_confidence: float = 0.0,
+    min_trust: int = 0,
+    mode: str = "vector",
 ) -> str:
     """
     Semantic search with multi-factor scoring.
 
-    Final score = cosine_similarity × recency_factor × confidence
+    mode:
+      'vector'  — cosine similarity via sqlite-vec (requires Ollama / embedding model)
+      'keyword' — BM25 full-text search via FTS5 (no embedding needed; Pi-friendly)
+      'hybrid'  — both; scores normalised and merged, highest-ranked wins per memory
+
+    Final score = sim × recency_factor × confidence × trust_weight
       recency_weight: 0.0 = pure cosine (default); 1.0 = strong recency bias
       min_confidence: exclude memories below this threshold (default 0 = show all)
+      min_trust: exclude memories below this trust tier (default 0 = show all)
+                 1=external, 2=inferred, 3=system, 4=hardware, 5=user
     """
+    if mode not in ("vector", "keyword", "hybrid"):
+        return "mode must be one of: vector, keyword, hybrid"
+
     db = get_db()
-    # superseded_by IS NULL always applied — superseded memories are hidden by default
-    wheres, params = ["m.superseded_by IS NULL"], []
+    now = time.time()
+
+    # Build shared WHERE fragments for both paths
+    mem_wheres: list[str] = ["m.superseded_by IS NULL"]
+    mem_params: list     = []
     if entity_name:
-        wheres.append("e.name=?");        params.append(entity_name)
+        mem_wheres.append("e.name=?");          mem_params.append(entity_name)
     if category:
-        wheres.append("m.category=?");    params.append(category)
+        mem_wheres.append("m.category=?");      mem_params.append(category)
     if min_confidence > 0.0:
-        wheres.append("m.confidence>=?"); params.append(min_confidence)
-    where_sql = "WHERE " + " AND ".join(wheres)
-    q_vec = await embed(query)
+        mem_wheres.append("m.confidence>=?");   mem_params.append(min_confidence)
+    if min_trust > 0:
+        mem_wheres.append("m.source_trust>=?"); mem_params.append(min_trust)
+    mem_where_sql = "WHERE " + " AND ".join(mem_wheres)
 
-    # Fetch a wider candidate set so re-ranking has material to work with
-    rows = db.execute(
-        f"""SELECT e.name, m.id, m.fact, m.category, m.confidence, m.updated,
-                   vec_distance_cosine(v.embedding,?) AS dist
-            FROM memory_vectors v
-            JOIN memories m ON m.id=v.rowid
-            JOIN entities e ON e.id=m.entity_id
-            {where_sql}
-            ORDER BY dist ASC LIMIT ?""",
-        [vec_blob(q_vec)] + params + [top_k * 3],
-    ).fetchall()
+    # ── vector path ────────────────────────────────────────────────────────────
+    vec_scored: dict[int, tuple[float, Any]] = {}  # id → (score, row)
+    if mode in ("vector", "hybrid"):
+        q_vec = await embed(query)
+        rows = db.execute(
+            f"""SELECT e.name, m.id, m.fact, m.category, m.confidence,
+                       m.source_trust, m.updated,
+                       vec_distance_cosine(v.embedding,?) AS dist
+                FROM memory_vectors v
+                JOIN memories m ON m.id=v.rowid
+                JOIN entities e ON e.id=m.entity_id
+                {mem_where_sql}
+                ORDER BY dist ASC LIMIT ?""",
+            [vec_blob(q_vec)] + mem_params + [top_k * 3],
+        ).fetchall()
+        for r in rows:
+            sim          = 1.0 - r["dist"]
+            rec          = _recency_factor(r["updated"], recency_weight)
+            trust_weight = r["source_trust"] / TRUST_USER
+            score        = sim * rec * r["confidence"] * trust_weight
+            vec_scored[r["id"]] = (score, r)
 
-    if not rows:
-        db.close()
+    # ── keyword path ───────────────────────────────────────────────────────────
+    kw_scored: dict[int, tuple[float, Any]] = {}
+    if mode in ("keyword", "hybrid"):
+        fts_q = _fts_query(query)
+        # FTS5 WHERE can't use the same param list — build entity join separately
+        fts_wheres  = ["m.superseded_by IS NULL", "memories_fts MATCH ?"]
+        fts_params  = [fts_q]
+        if entity_name:
+            fts_wheres.append("e.name=?"); fts_params.append(entity_name)
+        if category:
+            fts_wheres.append("m.category=?"); fts_params.append(category)
+        if min_confidence > 0.0:
+            fts_wheres.append("m.confidence>=?"); fts_params.append(min_confidence)
+        if min_trust > 0:
+            fts_wheres.append("m.source_trust>=?"); fts_params.append(min_trust)
+        fts_where_sql = "WHERE " + " AND ".join(fts_wheres)
+
+        kw_rows = db.execute(
+            f"""SELECT e.name, m.id, m.fact, m.category, m.confidence,
+                       m.source_trust, m.updated,
+                       bm25(memories_fts) AS rank
+                FROM memories_fts
+                JOIN memories m ON m.id = memories_fts.rowid
+                JOIN entities e ON e.id = m.entity_id
+                {fts_where_sql}
+                ORDER BY rank
+                LIMIT ?""",
+            fts_params + [top_k * 3],
+        ).fetchall()
+
+        # Normalise BM25 scores to [0, 1].
+        # bm25() returns negative: most negative = best match.
+        if kw_rows:
+            min_rank = min(r["rank"] for r in kw_rows)  # most negative = best
+            for r in kw_rows:
+                norm_sim     = r["rank"] / min_rank if min_rank != 0 else 1.0
+                rec          = _recency_factor(r["updated"], recency_weight)
+                trust_weight = r["source_trust"] / TRUST_USER
+                score        = norm_sim * rec * r["confidence"] * trust_weight
+                kw_scored[r["id"]] = (score, r)
+
+    # ── merge ──────────────────────────────────────────────────────────────────
+    all_ids = set(vec_scored) | set(kw_scored)
+    merged: list[tuple[float, Any]] = []
+    for mid in all_ids:
+        vs = vec_scored.get(mid, (0.0, None))
+        ks = kw_scored.get(mid, (0.0, None))
+        score = max(vs[0], ks[0])
+        row   = vs[1] if vs[1] is not None else ks[1]
+        merged.append((score, row))
+    merged.sort(key=lambda x: x[0], reverse=True)
+    scored = merged[:top_k]
+
+    db.close()
+
+    if not scored:
         return "No relevant memories found."
 
-    # Multi-factor re-ranking: sim × recency × confidence
-    scored = []
-    for r in rows:
-        sim   = 1.0 - r["dist"]
-        rec   = _recency_factor(r["updated"], recency_weight)
-        score = sim * rec * r["confidence"]
-        scored.append((score, r))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    scored = scored[:top_k]
-
-    # Update access tracking + apply recall confidence boost for returned memories
-    now = time.time()
+    # Update access tracking
+    db2 = get_db()
     for _, r in scored:
         new_conf = min(1.0, r["confidence"] + DECAY_RECALL_BOOST)
-        db.execute(
+        db2.execute(
             """UPDATE memories
                SET last_accessed=?, access_count=access_count+1, confidence=?
                WHERE id=?""",
             (now, new_conf, r["id"]),
         )
-    db.commit()
-    db.close()
+    db2.commit()
+    db2.close()
 
-    lines = [f"Top {len(scored)} memories for: {query!r}\n"]
+    lines = [f"Top {len(scored)} memories [{mode}] for: {query!r}\n"]
     for score, r in scored:
         age = _age_label(r["updated"])
-        lines.append(f"  [{r['name']} / {r['category']}] sim={round(score,3)}  {r['fact']}  ({age})")
+        lines.append(f"  [{r['name']} / {r['category']}] score={round(score,3)}  {r['fact']}  ({age})")
     return "\n".join(lines)
 
 
@@ -1119,6 +1474,7 @@ async def tool_get_context(
     entity_name: str,
     context_query: str,
     max_facts: int = 5,
+    min_trust: int = 0,
 ) -> str:
     """
     Relevance-filtered context snapshot for an entity — preferred over get_profile
@@ -1127,6 +1483,9 @@ async def tool_get_context(
     Returns the max_facts most query-relevant memories, plus relationships,
     latest readings, and upcoming schedule.  Access tracking is updated for
     all returned memories so popular facts rise in future rankings.
+
+    min_trust: if > 0, only return memories at or above this trust tier
+               (1=external, 2=inferred, 3=system, 4=hardware, 5=user)
     """
     db = get_db()
     e = db.execute("SELECT * FROM entities WHERE name=?", (entity_name,)).fetchone()
@@ -1135,16 +1494,18 @@ async def tool_get_context(
         return f"No entity named {entity_name!r}."
     eid = e["id"]
 
-    # Semantically relevant memories
+    # Semantically relevant memories, optionally filtered by trust tier
     q_vec = await embed(context_query)
+    trust_clause = "AND m.source_trust>=?" if min_trust > 0 else ""
+    trust_param  = [min_trust] if min_trust > 0 else []
     mem_rows = db.execute(
-        """SELECT m.id, m.fact, m.category, m.confidence, m.updated,
+        f"""SELECT m.id, m.fact, m.category, m.confidence, m.source_trust, m.updated,
                   vec_distance_cosine(v.embedding,?) AS dist
            FROM memory_vectors v
            JOIN memories m ON m.id=v.rowid
-           WHERE m.entity_id=? AND m.superseded_by IS NULL
+           WHERE m.entity_id=? AND m.superseded_by IS NULL {trust_clause}
            ORDER BY dist ASC LIMIT ?""",
-        [vec_blob(q_vec), eid, max_facts],
+        [vec_blob(q_vec), eid] + trust_param + [max_facts],
     ).fetchall()
 
     # Update access tracking
@@ -1261,6 +1622,7 @@ async def tool_extract_and_remember(
             category=category,
             confidence=confidence,
             source="extract",
+            source_trust=TRUST_DEFAULT_EXTRACT,
         )
         stored += 1
 
@@ -1354,6 +1716,385 @@ async def tool_get_session(session_id: int) -> str:
     else:
         out.append("  (no turns recorded)")
     return "\n".join(out)
+
+
+# ── Session search (FTS5) ──────────────────────────────────────────────────────
+
+async def tool_search_sessions(
+    query: str,
+    entity_name: str | None = None,
+    limit: int = 10,
+) -> str:
+    """
+    Full-text keyword search across session turn content using FTS5 BM25.
+
+    No embedding model required — suitable for low-resource environments (Pi, etc.).
+    The agent should pass substantive keywords, not natural-language questions.
+    E.g. "database migration schema" not "what did we discuss about migrations?"
+
+    Returns matching turns with session context (entity, timestamp, summary).
+    """
+    fts_q = _fts_query(query)
+    if not fts_q.strip():
+        return "No searchable terms in query."
+
+    db = get_db()
+    wheres  = ["session_turns_fts MATCH ?"]
+    params: list = [fts_q]
+    if entity_name:
+        wheres.append("e.name=?")
+        params.append(entity_name)
+    where_sql = "WHERE " + " AND ".join(wheres)
+
+    rows = db.execute(
+        f"""SELECT t.id AS turn_id, t.session_id, t.role, t.content, t.ts,
+                   s.started_at, s.ended_at, s.summary,
+                   e.name AS entity_name,
+                   bm25(session_turns_fts) AS rank
+            FROM session_turns_fts
+            JOIN session_turns t ON t.id = session_turns_fts.rowid
+            JOIN sessions      s ON s.id = t.session_id
+            JOIN entities      e ON e.id = s.entity_id
+            {where_sql}
+            ORDER BY rank
+            LIMIT ?""",
+        params + [limit],
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return f"No session turns matched {query!r}."
+
+    lines = [f"Session search results [keyword/FTS5] for: {query!r}\n"]
+    seen_sessions: set[int] = set()
+    for r in rows:
+        sid = r["session_id"]
+        if sid not in seen_sessions:
+            started = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["started_at"]))
+            lines.append(f"\n  ── Session {sid} | {r['entity_name']} | {started} ──")
+            if r["summary"]:
+                lines.append(f"     Summary: {r['summary']}")
+            seen_sessions.add(sid)
+        ts_str  = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+        snippet = r["content"][:200] + ("…" if len(r["content"]) > 200 else "")
+        lines.append(f"     [{ts_str}] {r['role']}: {snippet}")
+    return "\n".join(lines)
+
+
+# ── Token-budget context assembly ──────────────────────────────────────────────
+
+async def tool_get_context_budget(
+    entity_name: str,
+    context_query: str,
+    token_budget: int = 1500,
+    recall_mode: str = "hybrid",
+    include_readings: bool = True,
+) -> str:
+    """
+    Token-budget-aware context snapshot for an entity.
+
+    Ranked memories, readings, and relations are added greedily until the budget
+    is reached.  Useful for resource-constrained environments (Raspberry Pi, small
+    models) where injecting everything is not viable.
+
+    token_budget : target maximum tokens (1 token ≈ 4 characters)
+    recall_mode  : 'vector' | 'keyword' | 'hybrid'
+                   'keyword' requires no embedding model — fastest on a Pi
+    include_readings : whether to add latest sensor readings to the budget
+    """
+    if recall_mode not in ("vector", "keyword", "hybrid"):
+        return "recall_mode must be one of: vector, keyword, hybrid"
+
+    db = get_db()
+    e = db.execute("SELECT * FROM entities WHERE name=?", (entity_name,)).fetchone()
+    if not e:
+        db.close()
+        return f"No entity named {entity_name!r}."
+    eid = e["id"]
+
+    budget_left  = token_budget
+    used_tokens  = 0
+    truncated    = False
+    lines: list[str] = []
+
+    def _add(text: str) -> bool:
+        nonlocal budget_left, used_tokens, truncated
+        cost = _est_tokens(text)
+        if budget_left >= cost:
+            lines.append(text)
+            budget_left  -= cost
+            used_tokens  += cost
+            return True
+        truncated = True
+        return False
+
+    # Header — always included (tiny cost)
+    _add(f"Context [{entity_name} / {e['type']}] | query: {context_query!r}")
+
+    # ── Ranked memories ────────────────────────────────────────────────────────
+    mem_rows: list[Any] = []
+
+    if recall_mode in ("vector", "hybrid"):
+        q_vec = await embed(context_query)
+        vec_rows = db.execute(
+            """SELECT m.id, m.fact, m.category, m.confidence, m.source_trust,
+                      m.updated, vec_distance_cosine(v.embedding,?) AS dist
+               FROM memory_vectors v
+               JOIN memories m ON m.id=v.rowid
+               WHERE m.entity_id=? AND m.superseded_by IS NULL
+               ORDER BY dist ASC LIMIT ?""",
+            (vec_blob(q_vec), eid, token_budget // 20),
+        ).fetchall()
+        for r in vec_rows:
+            sim   = 1.0 - r["dist"]
+            trust = r["source_trust"] / TRUST_USER
+            score = sim * r["confidence"] * trust
+            mem_rows.append((score, r))
+
+    if recall_mode in ("keyword", "hybrid"):
+        fts_q = _fts_query(context_query)
+        kw_rows_raw = db.execute(
+            """SELECT m.id, m.fact, m.category, m.confidence, m.source_trust,
+                      m.updated, bm25(memories_fts) AS rank
+               FROM memories_fts
+               JOIN memories m ON m.id = memories_fts.rowid
+               WHERE memories_fts MATCH ? AND m.entity_id=? AND m.superseded_by IS NULL
+               ORDER BY rank LIMIT ?""",
+            (fts_q, eid, token_budget // 20),
+        ).fetchall()
+        if kw_rows_raw:
+            min_rank = min(r["rank"] for r in kw_rows_raw)
+            seen_ids = {r[1]["id"] for r in mem_rows}
+            for r in kw_rows_raw:
+                if r["id"] in seen_ids:
+                    continue
+                norm  = r["rank"] / min_rank if min_rank != 0 else 1.0
+                trust = r["source_trust"] / TRUST_USER
+                score = norm * r["confidence"] * trust
+                mem_rows.append((score, r))
+
+    mem_rows.sort(key=lambda x: x[0], reverse=True)
+
+    mem_added = 0
+    if mem_rows:
+        _add("Memories:")
+    for score, r in mem_rows:
+        fact_line = f"  [{r['category']}] {r['fact']}  ({_age_label(r['updated'])})"
+        if _add(fact_line):
+            mem_added += 1
+        else:
+            break
+
+    # ── Latest readings ────────────────────────────────────────────────────────
+    if include_readings:
+        readings = db.execute(
+            """SELECT metric, unit, value_type, value_num, value_cat, value_json,
+                      MAX(ts) AS ts
+               FROM readings WHERE entity_id=? GROUP BY metric ORDER BY metric""",
+            (eid,),
+        ).fetchall()
+        if readings:
+            _add("Readings:")
+            for r in readings:
+                _add(f"  {r['metric']}: {_fmt(r)}  ({_age_label(r['ts'])})")
+
+    # ── Relations ─────────────────────────────────────────────────────────────
+    rels = db.execute(
+        """SELECT e2.name AS other, r.rel_type FROM relations r
+           JOIN entities e2 ON e2.id=r.entity_b
+           WHERE r.entity_a=? AND r.valid_until IS NULL
+           UNION
+           SELECT e1.name AS other, r.rel_type||'_of' FROM relations r
+           JOIN entities e1 ON e1.id=r.entity_a
+           WHERE r.entity_b=? AND r.valid_until IS NULL""",
+        (eid, eid),
+    ).fetchall()
+    if rels:
+        _add("Relations:")
+        for r in rels:
+            _add(f"  {r['rel_type']} → {r['other']}")
+
+    db.close()
+
+    lines.append(
+        f"\n[Budget: {used_tokens}/{token_budget} tokens"
+        f" | mode={recall_mode}"
+        f" | {mem_added} memories"
+        + (" | truncated" if truncated else "")
+        + "]"
+    )
+    return "\n".join(lines)
+
+
+# ── Prospective / intention memory ─────────────────────────────────────────────
+
+async def tool_intend(
+    entity_name: str,
+    trigger_text: str,
+    action_text: str,
+    entity_type: str = "person",
+    expires_ts: float | None = None,
+) -> str:
+    """
+    Set a prospective intention: when trigger_text conditions are met, do action_text.
+
+    Examples:
+      trigger_text="Brian mentions being tired"
+      action_text="Suggest a 10-minute break and reduce task complexity"
+
+      trigger_text="temperature in living room drops below 68F"
+      action_text="Turn on the space heater and notify Brian"
+
+    Intentions are matched at recall time via FTS5 keyword search in check_intentions.
+    """
+    db  = get_db()
+    now = time.time()
+    eid = upsert_entity(db, entity_name, entity_type)
+    cur = db.execute(
+        """INSERT INTO intentions(entity_id, trigger_text, action_text, expires_ts, created)
+           VALUES (?,?,?,?,?)""",
+        (eid, trigger_text.strip(), action_text.strip(), expires_ts, now),
+    )
+    iid = cur.lastrowid
+    db.commit()
+    db.close()
+    exp_str = f", expires {time.strftime('%Y-%m-%d %H:%M', time.localtime(expires_ts))}" \
+              if expires_ts else ""
+    return f"Intention set: id={iid} for {entity_name!r}{exp_str}."
+
+
+async def tool_check_intentions(
+    entity_name: str,
+    text: str,
+) -> str:
+    """
+    Check whether the given text triggers any active intentions for an entity.
+
+    Uses FTS5 keyword matching on trigger_text.  The agent is responsible for
+    deciding whether to act on the returned intentions based on semantic fit.
+    Increments fired_count for matched intentions.
+
+    Returns a list of triggered intentions with their action_text, or a message
+    saying no intentions were triggered.
+    """
+    db  = get_db()
+    now = time.time()
+    e = db.execute("SELECT id FROM entities WHERE name=?", (entity_name,)).fetchone()
+    if not e:
+        db.close()
+        return f"No entity named {entity_name!r}."
+
+    fts_q = _fts_query(text)
+    if not fts_q.strip():
+        db.close()
+        return "No searchable terms in text."
+
+    rows = db.execute(
+        """SELECT i.id, i.trigger_text, i.action_text, i.fired_count
+           FROM intentions_fts
+           JOIN intentions i ON i.id = intentions_fts.rowid
+           WHERE intentions_fts MATCH ?
+             AND i.entity_id=?
+             AND i.active=1
+             AND (i.expires_ts IS NULL OR i.expires_ts > ?)
+           ORDER BY bm25(intentions_fts)
+           LIMIT 10""",
+        (fts_q, e["id"], now),
+    ).fetchall()
+
+    if not rows:
+        db.close()
+        return f"No intentions triggered for {entity_name!r} by this text."
+
+    # Update fired_count
+    for r in rows:
+        db.execute(
+            "UPDATE intentions SET fired_count=fired_count+1, last_fired=? WHERE id=?",
+            (now, r["id"]),
+        )
+    db.commit()
+    db.close()
+
+    lines = [f"Triggered intentions for {entity_name!r} ({len(rows)}):\n"]
+    for r in rows:
+        lines.append(f"  id={r['id']} trigger: {r['trigger_text']!r}")
+        lines.append(f"          action:  {r['action_text']!r}")
+        lines.append(f"          fired {r['fired_count']+1} time(s)")
+    return "\n".join(lines)
+
+
+async def tool_dismiss_intention(intention_id: int) -> str:
+    """
+    Deactivate an intention so it is no longer matched by check_intentions.
+    The row is preserved for history; active is set to 0.
+    """
+    db = get_db()
+    row = db.execute("SELECT id, active FROM intentions WHERE id=?", (intention_id,)).fetchone()
+    if not row:
+        db.close()
+        return f"No intention with id={intention_id}."
+    if not row["active"]:
+        db.close()
+        return f"Intention {intention_id} is already dismissed."
+    db.execute("UPDATE intentions SET active=0 WHERE id=?", (intention_id,))
+    db.commit()
+    db.close()
+    return f"Intention {intention_id} dismissed."
+
+
+async def tool_list_intentions(
+    entity_name: str | None = None,
+    active_only: bool = True,
+) -> str:
+    """
+    List prospective intentions, optionally filtered by entity.
+
+    active_only: True (default) = only active intentions; False = all including dismissed
+    """
+    db  = get_db()
+    now = time.time()
+    wheres: list[str] = []
+    params: list      = []
+    if entity_name:
+        e = db.execute("SELECT id FROM entities WHERE name=?", (entity_name,)).fetchone()
+        if not e:
+            db.close()
+            return f"No entity named {entity_name!r}."
+        wheres.append("i.entity_id=?")
+        params.append(e["id"])
+    if active_only:
+        wheres.append("i.active=1")
+    where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+
+    rows = db.execute(
+        f"""SELECT i.id, i.trigger_text, i.action_text, i.fired_count,
+                   i.expires_ts, i.active, e.name AS entity_name
+            FROM intentions i
+            LEFT JOIN entities e ON e.id = i.entity_id
+            {where_sql}
+            ORDER BY i.created DESC
+            LIMIT 100""",
+        params,
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return "No intentions found."
+
+    lines = []
+    for r in rows:
+        status = "active" if r["active"] else "dismissed"
+        exp_str = ""
+        if r["expires_ts"]:
+            rem = r["expires_ts"] - now
+            exp_str = f", expires in {int(rem)}s" if rem > 0 else ", expired"
+        entity_str = f" [{r['entity_name']}]" if r["entity_name"] else ""
+        lines.append(
+            f"  id={r['id']}{entity_str} [{status}] fired={r['fired_count']}{exp_str}"
+        )
+        lines.append(f"    trigger: {r['trigger_text']!r}")
+        lines.append(f"    action:  {r['action_text']!r}")
+    return "Intentions:\n" + "\n".join(lines)
 
 
 # ── Tier 3 — Pattern engine ────────────────────────────────────────────────────
@@ -1654,9 +2395,10 @@ async def _maybe_promote(
     now = time.time()
     vec = await embed(fact)
     cur = db.execute(
-        """INSERT INTO memories(entity_id,fact,category,confidence,source,created,updated)
-           VALUES(?,?,'insight',?,'pattern_engine',?,?)""",
-        (eid, fact, confidence, now, now),
+        """INSERT INTO memories
+               (entity_id, fact, category, confidence, source, source_trust, created, updated)
+           VALUES (?, ?, 'insight', ?, 'pattern_engine', ?, ?, ?)""",
+        (eid, fact, confidence, TRUST_DEFAULT_PATTERN, now, now),
     )
     mid = cur.lastrowid
     db.execute(
@@ -2023,6 +2765,391 @@ async def tool_get_fading_memories(
     return "\n".join(lines)
 
 
+# ── Working memory (Tier 1.75) ─────────────────────────────────────────────────
+
+async def tool_wm_open(
+    task_name: str,
+    entity_name: str | None = None,
+    ttl_seconds: int | None = None,
+) -> str:
+    """
+    Open a new working-memory task scope.  Returns the integer task_id.
+
+    task_name   : Human-readable label for this task/goal.
+    entity_name : Optional — associate the task with an entity (must already exist).
+    ttl_seconds : Optional — auto-expire after this many seconds (None = no expiry).
+    """
+    db = get_db()
+    now = time.time()
+
+    eid: int | None = None
+    if entity_name:
+        row = db.execute(
+            "SELECT id FROM entities WHERE name=?", (entity_name.strip(),)
+        ).fetchone()
+        eid = row["id"] if row else None
+
+    ttl_ts = now + ttl_seconds if (ttl_seconds and ttl_seconds > 0) else None
+
+    cur = db.execute(
+        "INSERT INTO working_memory_tasks(name, entity_id, status, ttl_ts, created)"
+        " VALUES (?,?,?,?,?)",
+        (task_name.strip(), eid, "open", ttl_ts, now),
+    )
+    task_id = cur.lastrowid
+    db.commit()
+    db.close()
+
+    exp_str = f", expires in {ttl_seconds}s" if ttl_seconds else ""
+    return f"Working memory task opened: id={task_id}{exp_str}."
+
+
+async def tool_wm_set(task_id: int, key: str, value) -> str:
+    """
+    Set (or overwrite) a key/value slot in a working-memory task.
+
+    value may be any JSON-serialisable type: str, int, float, list, dict, None.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT id, status FROM working_memory_tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if not row:
+        db.close()
+        return f"No working memory task with id={task_id}."
+    if row["status"] != "open":
+        db.close()
+        return f"Task {task_id} is {row['status']} — cannot write to a closed task."
+
+    now = time.time()
+    val_json = json.dumps(value)
+    db.execute(
+        """INSERT INTO working_memory_slots(task_id, key, value, created, updated)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(task_id, key) DO UPDATE
+               SET value=excluded.value, updated=excluded.updated""",
+        (task_id, key.strip(), val_json, now, now),
+    )
+    db.commit()
+    db.close()
+    return f"Set working memory [{task_id}].{key!r}."
+
+
+async def tool_wm_get(task_id: int, key: str | None = None) -> str:
+    """
+    Retrieve one slot (by key) or all slots from a working-memory task.
+
+    If key is omitted, returns a JSON object with task metadata and all slots.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT id, name, status, ttl_ts, created, closed_at, entity_id"
+        " FROM working_memory_tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        db.close()
+        return f"No working memory task with id={task_id}."
+
+    if key:
+        slot = db.execute(
+            "SELECT value FROM working_memory_slots WHERE task_id=? AND key=?",
+            (task_id, key.strip()),
+        ).fetchone()
+        db.close()
+        if not slot:
+            return f"No slot '{key}' in task {task_id}."
+        return json.dumps(json.loads(slot["value"]), indent=2)
+
+    slots = db.execute(
+        "SELECT key, value, updated FROM working_memory_slots"
+        " WHERE task_id=? ORDER BY key",
+        (task_id,),
+    ).fetchall()
+
+    entity_name: str | None = None
+    if row["entity_id"]:
+        e = db.execute(
+            "SELECT name FROM entities WHERE id=?", (row["entity_id"],)
+        ).fetchone()
+        entity_name = e["name"] if e else None
+
+    db.close()
+
+    result = {
+        "task_id": task_id,
+        "name": row["name"],
+        "status": row["status"],
+        "entity": entity_name,
+        "created": row["created"],
+        "closed_at": row["closed_at"],
+        "ttl_ts": row["ttl_ts"],
+        "slots": {s["key"]: json.loads(s["value"]) for s in slots},
+    }
+    return json.dumps(result, indent=2)
+
+
+async def tool_wm_list(
+    entity_name: str | None = None,
+    status: str = "open",
+) -> str:
+    """
+    List working-memory tasks.
+
+    status      : 'open' | 'closed' | 'expired' | 'all'  (default 'open')
+    entity_name : Scope to one entity; omit for all entities.
+    """
+    db = get_db()
+    if status not in ("open", "closed", "expired", "all"):
+        db.close()
+        return "status must be one of: open, closed, expired, all"
+
+    now = time.time()
+    where_parts: list[str] = []
+    params: list = []
+
+    if status != "all":
+        where_parts.append("t.status=?")
+        params.append(status)
+
+    if entity_name:
+        e = db.execute(
+            "SELECT id FROM entities WHERE name=?", (entity_name.strip(),)
+        ).fetchone()
+        if not e:
+            db.close()
+            return f"No entity named '{entity_name}'."
+        where_parts.append("t.entity_id=?")
+        params.append(e["id"])
+
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    tasks = db.execute(
+        f"""SELECT t.id, t.name, t.status, t.ttl_ts, t.created,
+                   e.name AS entity_name,
+                   COUNT(s.id) AS slot_count
+            FROM working_memory_tasks t
+            LEFT JOIN entities e ON e.id = t.entity_id
+            LEFT JOIN working_memory_slots s ON s.task_id = t.id
+            {where_clause}
+            GROUP BY t.id
+            ORDER BY t.created DESC
+            LIMIT 100""",
+        params,
+    ).fetchall()
+    db.close()
+
+    if not tasks:
+        return "No working memory tasks found."
+
+    lines = []
+    for t in tasks:
+        ttl_str = ""
+        if t["ttl_ts"]:
+            rem = t["ttl_ts"] - now
+            ttl_str = f", expires in {int(rem)}s" if rem > 0 else ", expired"
+        entity_str = f" [{t['entity_name']}]" if t["entity_name"] else ""
+        lines.append(
+            f"  id={t['id']} {t['name']!r}{entity_str}"
+            f" status={t['status']} slots={t['slot_count']}{ttl_str}"
+        )
+    return "Working memory tasks:\n" + "\n".join(lines)
+
+
+async def tool_wm_close(task_id: int, promote: bool = False) -> str:
+    """
+    Close a working-memory task.
+
+    promote : If True and the task has an entity, all slots are bundled into a
+              long-term memory at TRUST_INFERRED (2) so agents can recall them later.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT id, name, status, entity_id FROM working_memory_tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        db.close()
+        return f"No working memory task with id={task_id}."
+    if row["status"] != "open":
+        db.close()
+        return f"Task {task_id} is already {row['status']}."
+
+    now = time.time()
+    db.execute(
+        "UPDATE working_memory_tasks SET status='closed', closed_at=? WHERE id=?",
+        (now, task_id),
+    )
+    db.commit()
+
+    promoted_msg = ""
+    if promote and row["entity_id"]:
+        slots = db.execute(
+            "SELECT key, value FROM working_memory_slots WHERE task_id=? ORDER BY key",
+            (task_id,),
+        ).fetchall()
+        if slots:
+            # Resolve entity name for tool_remember
+            e = db.execute(
+                "SELECT name FROM entities WHERE id=?", (row["entity_id"],)
+            ).fetchone()
+            db.close()
+            if e:
+                parts = [f"{s['key']}={json.loads(s['value'])!r}" for s in slots]
+                fact = f"Working task '{row['name']}' summary: " + "; ".join(parts)
+                await tool_remember(
+                    entity_name=e["name"],
+                    fact=fact,
+                    category="general",
+                    confidence=0.8,
+                    source="working_memory",
+                    source_trust=TRUST_INFERRED,
+                )
+                promoted_msg = f" Promoted {len(slots)} slot(s) to long-term memory."
+            else:
+                promoted_msg = " Entity not found; promotion skipped."
+        else:
+            db.close()
+            promoted_msg = " No slots to promote."
+    else:
+        db.close()
+        if promote and not row["entity_id"]:
+            promoted_msg = " No entity linked to task; promotion skipped."
+
+    return f"Task {task_id} closed.{promoted_msg}"
+
+
+async def _consolidate_episodes() -> int:
+    """
+    Episodic consolidation: for each closed session not yet consolidated,
+    use the LLM to extract 2–5 durable semantic facts and store them at
+    TRUST_INFERRED.  Marks session as consolidated=1 when done.
+
+    This bridges the recall layer (raw episodic turns) and the semantic layer
+    (long-term entity memories) — the 'sleep-time synthesis' pattern.
+
+    Returns the number of sessions processed.
+    """
+    db = get_db()
+    sessions = db.execute(
+        """SELECT s.id, s.entity_id, e.name AS entity_name, e.type AS entity_type
+           FROM sessions s
+           JOIN entities e ON e.id = s.entity_id
+           WHERE s.ended_at IS NOT NULL AND s.consolidated=0
+           ORDER BY s.ended_at ASC
+           LIMIT 20"""
+    ).fetchall()
+    db.close()
+
+    if not sessions:
+        return 0
+
+    processed = 0
+    for sess in sessions:
+        db = get_db()
+        turns = db.execute(
+            """SELECT role, content FROM session_turns
+               WHERE session_id=? AND role IN ('user','assistant')
+               ORDER BY ts""",
+            (sess["id"],),
+        ).fetchall()
+        db.close()
+
+        if not turns:
+            db = get_db()
+            db.execute("UPDATE sessions SET consolidated=1 WHERE id=?", (sess["id"],))
+            db.commit()
+            db.close()
+            processed += 1
+            continue
+
+        # Build a compact transcript (cap at ~2000 chars to keep LLM cost low)
+        transcript_parts = []
+        total = 0
+        for t in turns:
+            line = f"{t['role'].capitalize()}: {t['content']}"
+            if total + len(line) > 2000:
+                transcript_parts.append("[… truncated …]")
+                break
+            transcript_parts.append(line)
+            total += len(line)
+        transcript = "\n".join(transcript_parts)
+
+        prompt = (
+            f"Extract 2–5 durable, factual observations about '{sess['entity_name']}' "
+            f"from this conversation.  Return a JSON array of objects with keys "
+            f"'fact' (string) and 'category' "
+            f"(one of: preference, habit, routine, relationship, insight, general).\n\n"
+            f"Only include facts that would still be true in a week.  "
+            f"Skip procedural steps, debugging noise, and one-off decisions.\n\n"
+            f"Conversation:\n{transcript}\n\nJSON array:"
+        )
+
+        try:
+            raw = await _call_llm(prompt, LLM_MODEL)
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            facts = json.loads(raw)
+        except Exception as exc:
+            log.warning(f"Episode consolidation LLM error (session {sess['id']}): {exc}")
+            db = get_db()
+            db.execute("UPDATE sessions SET consolidated=1 WHERE id=?", (sess["id"],))
+            db.commit()
+            db.close()
+            processed += 1
+            continue
+
+        if isinstance(facts, list):
+            for item in facts:
+                if not isinstance(item, dict) or "fact" not in item:
+                    continue
+                fact     = str(item["fact"]).strip()
+                category = str(item.get("category", "general"))
+                if not fact:
+                    continue
+                try:
+                    await tool_remember(
+                        entity_name=sess["entity_name"],
+                        fact=fact,
+                        entity_type=sess["entity_type"],
+                        category=category,
+                        confidence=0.75,
+                        source="episode_consolidation",
+                        source_trust=TRUST_DEFAULT_EXTRACT,
+                    )
+                except Exception as exc:
+                    log.warning(f"Episode consolidation store error: {exc}")
+
+        db = get_db()
+        db.execute("UPDATE sessions SET consolidated=1 WHERE id=?", (sess["id"],))
+        db.commit()
+        db.close()
+        processed += 1
+
+    return processed
+
+
+async def _expire_working_memory() -> int:
+    """
+    Mark open tasks whose ttl_ts is in the past as 'expired'.
+    Called by the pattern engine loop.  Returns number of tasks expired.
+    """
+    db = get_db()
+    now = time.time()
+    cur = db.execute(
+        "UPDATE working_memory_tasks SET status='expired', closed_at=?"
+        " WHERE status='open' AND ttl_ts IS NOT NULL AND ttl_ts < ?",
+        (now, now),
+    )
+    count = cur.rowcount
+    db.commit()
+    db.close()
+    return count
+
+
 async def pattern_engine_loop():
     """Background task: build rollups, detect patterns, and prune old readings."""
     await asyncio.sleep(60)   # let server settle before first run
@@ -2038,8 +3165,16 @@ async def pattern_engine_loop():
                 log.info(f"Pattern engine: consolidated {n} near-duplicate memories.")
             log.info("Pattern engine: decaying memory confidence…")
             await _decay_memories()
+            log.info("Pattern engine: consolidating episode memories…")
+            n_ep = await _consolidate_episodes()
+            if n_ep:
+                log.info(f"Pattern engine: consolidated {n_ep} episode session(s).")
             log.info("Pattern engine: pruning old readings…")
             await _prune_readings()
+            log.info("Pattern engine: expiring working memory tasks…")
+            n_expired = await _expire_working_memory()
+            if n_expired:
+                log.info(f"Pattern engine: expired {n_expired} working memory task(s).")
             db = get_db()
             db.execute("PRAGMA wal_checkpoint(PASSIVE)")
             db.close()
@@ -2064,6 +3199,9 @@ TOOLS = [
              "category":{"type":"string","enum":["preference","habit","routine","relationship","insight","general"],"default":"general"},
              "confidence":{"type":"number","default":1.0},
              "source":{"type":"string"},
+             "source_trust":{"type":"integer","default":5,
+                 "description":"Source trust tier: 5=user, 4=hardware, 3=system, 2=inferred, 1=external. "
+                                "Lower-trust facts will not supersede higher-trust contradicting memories."},
              "meta":{"type":"object"}}}),
     Tool(name="recall",
          description="Semantic search across all stored memories.",
@@ -2075,7 +3213,9 @@ TOOLS = [
              "recency_weight":{"type":"number","default":0.0,
                  "description":"0=pure cosine, 1=strong recency bias"},
              "min_confidence":{"type":"number","default":0.0,
-                 "description":"Exclude memories below this confidence threshold"}}}),
+                 "description":"Exclude memories below this confidence threshold"},
+             "min_trust":{"type":"integer","default":0,
+                 "description":"Exclude memories below this trust tier (0=all, 1=external+, 3=system+, 5=user only)"}}}),
     Tool(name="get_context",
          description=(
              "Relevance-filtered context snapshot for an entity — preferred over "
@@ -2085,7 +3225,9 @@ TOOLS = [
              "entity_name":{"type":"string"},
              "context_query":{"type":"string",
                  "description":"Current topic — used to select the most relevant memories"},
-             "max_facts":{"type":"integer","default":5}}}),
+             "max_facts":{"type":"integer","default":5},
+             "min_trust":{"type":"integer","default":0,
+                 "description":"Only include memories at or above this trust tier (0=all)"}}}),
     Tool(name="get_profile",
          description="Full profile: memories + relationships + latest readings + upcoming schedule.",
          inputSchema={"type":"object","required":["entity_name"],"properties":{"entity_name":{"type":"string"}}}),
@@ -2206,6 +3348,113 @@ TOOLS = [
              "threshold":{"type":"number","default":0.5,
                  "description":"Return memories with confidence below this value"},
              "limit":{"type":"integer","default":20}}}),
+    # Working memory (Tier 1.75)
+    Tool(name="wm_open",
+         description=(
+             "Open a new working-memory task scope for transient agent state. "
+             "Returns an integer task_id. Slots can be set/read via wm_set/wm_get. "
+             "Optionally auto-expires after ttl_seconds seconds."
+         ),
+         inputSchema={"type":"object","required":["task_name"],"properties":{
+             "task_name":{"type":"string",
+                 "description":"Human-readable label for this task or goal"},
+             "entity_name":{"type":"string",
+                 "description":"Associate with an existing entity (optional)"},
+             "ttl_seconds":{"type":"integer",
+                 "description":"Auto-expire after N seconds (omit = no expiry)"}}}),
+    Tool(name="wm_set",
+         description="Set (or overwrite) a key/value slot in an open working-memory task.",
+         inputSchema={"type":"object","required":["task_id","key","value"],"properties":{
+             "task_id":{"type":"integer"},
+             "key":{"type":"string"},
+             "value":{"description":"Any JSON-serialisable value: str, int, float, list, dict, null"}}}),
+    Tool(name="wm_get",
+         description=(
+             "Retrieve one slot by key, or all slots from a working-memory task. "
+             "Omit key to get the full task snapshot with metadata."
+         ),
+         inputSchema={"type":"object","required":["task_id"],"properties":{
+             "task_id":{"type":"integer"},
+             "key":{"type":"string","description":"Slot key; omit to return all slots"}}}),
+    Tool(name="wm_list",
+         description="List working-memory tasks, optionally filtered by entity or status.",
+         inputSchema={"type":"object","properties":{
+             "entity_name":{"type":"string",
+                 "description":"Scope to one entity; omit for all entities"},
+             "status":{"type":"string",
+                 "enum":["open","closed","expired","all"],"default":"open"}}}),
+    Tool(name="wm_close",
+         description=(
+             "Close a working-memory task. "
+             "If promote=true and the task has an entity, all slots are bundled into "
+             "a long-term memory at TRUST_INFERRED so agents can recall them later."
+         ),
+         inputSchema={"type":"object","required":["task_id"],"properties":{
+             "task_id":{"type":"integer"},
+             "promote":{"type":"boolean","default":False,
+                 "description":"Promote slots to long-term memory on close"}}}),
+    # FTS session search
+    Tool(name="search_sessions",
+         description=(
+             "Full-text keyword search across session turn content (FTS5/BM25). "
+             "No embedding model required — suitable for Pi/low-resource environments. "
+             "Pass substantive keywords, not full questions."
+         ),
+         inputSchema={"type":"object","required":["query"],"properties":{
+             "query":{"type":"string",
+                 "description":"Keywords to search (e.g. 'database migration schema')"},
+             "entity_name":{"type":"string",
+                 "description":"Scope to one entity; omit for all entities"},
+             "limit":{"type":"integer","default":10}}}),
+    # Token-budget context
+    Tool(name="get_context_budget",
+         description=(
+             "Token-budget-aware context snapshot — greedily fills a token limit "
+             "with ranked memories, readings, and relations. "
+             "Use recall_mode='keyword' for Pi/no-Ollama environments."
+         ),
+         inputSchema={"type":"object","required":["entity_name","context_query"],"properties":{
+             "entity_name":{"type":"string"},
+             "context_query":{"type":"string"},
+             "token_budget":{"type":"integer","default":1500,
+                 "description":"Maximum tokens to include (1 token ≈ 4 chars)"},
+             "recall_mode":{"type":"string",
+                 "enum":["vector","keyword","hybrid"],"default":"hybrid"},
+             "include_readings":{"type":"boolean","default":True}}}),
+    # Prospective / intention memory
+    Tool(name="intend",
+         description=(
+             "Set a prospective intention: when trigger_text conditions occur, "
+             "take action_text.  Matched by check_intentions at conversation time."
+         ),
+         inputSchema={"type":"object","required":["entity_name","trigger_text","action_text"],"properties":{
+             "entity_name":{"type":"string"},
+             "trigger_text":{"type":"string",
+                 "description":"Condition that activates the intention"},
+             "action_text":{"type":"string",
+                 "description":"What to do when the condition is met"},
+             "entity_type":{"type":"string","default":"person"},
+             "expires_ts":{"type":"number",
+                 "description":"Unix timestamp after which intention expires (omit = never)"}}}),
+    Tool(name="check_intentions",
+         description=(
+             "Check whether the given text triggers any active intentions for an entity. "
+             "Returns matched intentions with their action_text. "
+             "Call this at the start of each user turn to surface pending intentions."
+         ),
+         inputSchema={"type":"object","required":["entity_name","text"],"properties":{
+             "entity_name":{"type":"string"},
+             "text":{"type":"string",
+                 "description":"Current conversation text to match against intentions"}}}),
+    Tool(name="dismiss_intention",
+         description="Deactivate an intention so it is no longer matched. Row preserved for history.",
+         inputSchema={"type":"object","required":["intention_id"],"properties":{
+             "intention_id":{"type":"integer"}}}),
+    Tool(name="list_intentions",
+         description="List prospective intentions for an entity (or all entities).",
+         inputSchema={"type":"object","properties":{
+             "entity_name":{"type":"string"},
+             "active_only":{"type":"boolean","default":True}}}),
 ]
 
 
@@ -2237,6 +3486,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "prune":                tool_prune,
         "get_related":          tool_get_related,
         "get_fading_memories":  tool_get_fading_memories,
+        "wm_open":              tool_wm_open,
+        "wm_set":               tool_wm_set,
+        "wm_get":               tool_wm_get,
+        "wm_list":              tool_wm_list,
+        "wm_close":             tool_wm_close,
+        "search_sessions":      tool_search_sessions,
+        "get_context_budget":   tool_get_context_budget,
+        "intend":               tool_intend,
+        "check_intentions":     tool_check_intentions,
+        "dismiss_intention":    tool_dismiss_intention,
+        "list_intentions":      tool_list_intentions,
     }
     fn = dispatch.get(name)
     if not fn:

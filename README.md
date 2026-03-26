@@ -97,7 +97,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (527 tests, no Ollama needed)
+python -m pytest                     # full suite (682 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -130,6 +130,10 @@ TIER 1
 TIER 1.5
   sessions          id, entity_id, started_at, ended_at, summary, meta
   session_turns     id, session_id, role, content, ts
+
+TIER 1.75
+  working_memory_tasks   id, name, entity_id, status, ttl_ts, created, closed_at
+  working_memory_slots   id, task_id, key, value(JSON), created, updated
 
 TIER 2
   readings          id, entity_id, metric, unit, value_type, value_num,
@@ -187,6 +191,34 @@ TIER 3
 | `close_session`  | Close a session with optional summary               |
 | `get_session`    | Retrieve full session transcript                    |
 
+### Working memory (Tier 1.75)
+| Tool       | Description                                                          |
+|------------|----------------------------------------------------------------------|
+| `wm_open`  | Open a task-scoped scratchpad; optional TTL and entity association   |
+| `wm_set`   | Write a key/value slot into an open task                             |
+| `wm_get`   | Read one slot by key, or all slots with task metadata                |
+| `wm_list`  | List tasks filtered by status (open/closed/expired/all) and entity   |
+| `wm_close` | Close a task; optionally promote slots to long-term memory           |
+
+### FTS keyword recall + session search
+| Tool               | Description                                                      |
+|--------------------|------------------------------------------------------------------|
+| `recall` (mode=)   | Add `mode="keyword"` or `mode="hybrid"` for FTS5/BM25 recall — no embedding model needed |
+| `search_sessions`  | Full-text search across episodic session turns (FTS5/BM25)       |
+
+### Token-budget context assembly
+| Tool                  | Description                                                   |
+|-----------------------|---------------------------------------------------------------|
+| `get_context_budget`  | Greedily fills a token budget with ranked memories + readings; `recall_mode="keyword"` for Pi/no-Ollama |
+
+### Prospective / intention memory (Tier 4)
+| Tool                 | Description                                                    |
+|----------------------|----------------------------------------------------------------|
+| `intend`             | Set a condition → action intention for an entity               |
+| `check_intentions`   | Check if current text triggers any active intentions (FTS5)    |
+| `dismiss_intention`  | Deactivate an intention                                        |
+| `list_intentions`    | List active (or all) intentions for an entity                  |
+
 ### Cross-tier
 | Tool           | Description                                           |
 |----------------|-------------------------------------------------------|
@@ -204,7 +236,7 @@ TIER 3
 GET  /health                    liveness + row counts
 GET  /entities                  list all entities
 POST /remember                  store a memory
-POST /recall                    semantic search (recency_weight + min_confidence)
+POST /recall                    semantic search (mode=vector|keyword|hybrid, recency_weight, min_confidence)
 POST /get_context               relevance-filtered context snapshot
 GET  /profile/{entity_name}     full profile
 POST /relate                    create relationship
@@ -223,6 +255,20 @@ POST /log_turn                  append a turn (user/assistant/system) to a sessi
 POST /close_session             close a session with optional summary
 GET  /get_session/{id}          retrieve full session transcript
 POST /extract_and_remember      LLM-extract facts from text and store as memories
+
+POST /wm/open                   open a working-memory task scope
+POST /wm/set                    set a key/value slot in an open task
+POST /wm/get                    get one slot or all slots from a task
+GET  /wm/list                   list tasks (?status=open|closed|expired|all&entity_name=X)
+GET  /wm/{task_id}              get all slots and metadata for a task
+POST /wm/close                  close a task (promote=true bundles slots into long-term memory)
+
+POST /search_sessions           keyword search across session turn content (FTS5/BM25)
+POST /get_context_budget        token-budget context snapshot (greedy fill, truncated flag)
+POST /intend                    store a prospective intention (trigger_text → action_text)
+POST /check_intentions          check if text triggers any active intentions (FTS5)
+POST /dismiss_intention         deactivate an intention (soft-delete)
+GET  /intentions                list intentions (?entity_name=X&active_only=true)
 
 GET  /voices/unknown            list unenrolled provisional speaker entities
 POST /voices/enroll             rename provisional entity to real person

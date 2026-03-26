@@ -70,6 +70,7 @@ async def import_mem0(
     agent_id: str | None = None,
     app_id: str | None = None,
     entity_type: str = "person",
+    source_trust: int | None = None,
 ) -> ImportResult:
     """
     Paginate through all memories for user_id and import them into memory-mcp.
@@ -95,6 +96,12 @@ async def import_mem0(
     entity_name = sanitize_name(user_id)
     if not entity_name:
         raise ValueError(f"Invalid user_id: {user_id!r}")
+
+    trust = (
+        max(mem.TRUST_EXTERNAL, min(mem.TRUST_USER, int(source_trust)))
+        if source_trust is not None
+        else mem.TRUST_DEFAULT_IMPORT
+    )
 
     result  = ImportResult()
     headers = {}
@@ -168,9 +175,9 @@ async def import_mem0(
                 cur = db.execute(
                     """INSERT INTO memories
                            (entity_id, fact, category, confidence,
-                            source, created, updated)
-                       VALUES (?, ?, 'general', 1.0, ?, ?, ?)""",
-                    (eid, fact, _SOURCE_TAG, now, now),
+                            source, source_trust, created, updated)
+                       VALUES (?, ?, 'general', 1.0, ?, ?, ?, ?)""",
+                    (eid, fact, _SOURCE_TAG, trust, now, now),
                 )
                 mid = cur.lastrowid
                 db.execute(

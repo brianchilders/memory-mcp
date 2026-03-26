@@ -219,6 +219,11 @@ class RememberRequest(BaseModel):
     category: str = "general"
     confidence: float = 1.0
     source: str | None = None
+    source_trust: int | None = Field(
+        default=None,
+        ge=1, le=5,
+        description="Source trust tier: 5=user, 4=hardware, 3=system, 2=inferred, 1=external",
+    )
     meta: dict | None = None
 
 class RecallRequest(BaseModel):
@@ -228,11 +233,26 @@ class RecallRequest(BaseModel):
     top_k: int = 5
     recency_weight: float = 0.0
     min_confidence: float = 0.0
+    min_trust: int = Field(
+        default=0,
+        ge=0, le=5,
+        description="Exclude memories below this trust tier (0=all, 1=external+, 3=system+, 5=user only)",
+    )
+    mode: str = Field(
+        default="vector",
+        pattern="^(vector|keyword|hybrid)$",
+        description="Retrieval mode: vector (cosine), keyword (FTS5/BM25), or hybrid",
+    )
 
 class GetContextRequest(BaseModel):
     entity_name: str
     context_query: str
     max_facts: int = 5
+    min_trust: int = Field(
+        default=0,
+        ge=0, le=5,
+        description="Only include memories at or above this trust tier (0=all)",
+    )
 
 class RelateRequest(BaseModel):
     entity_a: str
@@ -307,6 +327,60 @@ class ExtractAndRememberRequest(BaseModel):
     text: str
     entity_type: str = "person"
     model: str | None = None
+
+
+class WmOpenRequest(BaseModel):
+    task_name: str
+    entity_name: str | None = None
+    ttl_seconds: int | None = Field(default=None, ge=1)
+
+class WmSetRequest(BaseModel):
+    task_id: int
+    key: str
+    value: object  # any JSON-serialisable value
+
+class WmGetRequest(BaseModel):
+    task_id: int
+    key: str | None = None
+
+class WmListRequest(BaseModel):
+    entity_name: str | None = None
+    status: str = Field(default="open", pattern="^(open|closed|expired|all)$")
+
+class WmCloseRequest(BaseModel):
+    task_id: int
+    promote: bool = False
+
+
+class SearchSessionsRequest(BaseModel):
+    query: str
+    entity_name: str | None = None
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class GetContextBudgetRequest(BaseModel):
+    entity_name: str
+    context_query: str
+    token_budget: int = Field(default=1500, ge=50, le=32000)
+    recall_mode: str = Field(default="hybrid", pattern="^(vector|keyword|hybrid)$")
+    include_readings: bool = True
+
+
+class IntendRequest(BaseModel):
+    entity_name: str
+    trigger_text: str
+    action_text: str
+    entity_type: str = "person"
+    expires_ts: float | None = None
+
+
+class CheckIntentionsRequest(BaseModel):
+    entity_name: str
+    text: str
+
+
+class DismissIntentionRequest(BaseModel):
+    intention_id: int
 
 
 # ── Helper: wrap any coroutine and surface errors as HTTP 500 ──────────────────
@@ -472,6 +546,87 @@ async def extract_and_remember(req: ExtractAndRememberRequest):
     return await run(mem.tool_extract_and_remember(**req.model_dump()))
 
 
+# ── Working memory (Tier 1.75) ─────────────────────────────────────────────────
+
+@app.post("/wm/open")
+async def wm_open(req: WmOpenRequest):
+    """Open a new working-memory task scope. Returns task_id."""
+    return await run(mem.tool_wm_open(**req.model_dump()))
+
+
+@app.post("/wm/set")
+async def wm_set(req: WmSetRequest):
+    """Set or overwrite a key/value slot in a working-memory task."""
+    return await run(mem.tool_wm_set(**req.model_dump()))
+
+
+@app.post("/wm/get")
+async def wm_get(req: WmGetRequest):
+    """Get one slot (by key) or all slots from a working-memory task."""
+    return await run(mem.tool_wm_get(**req.model_dump()))
+
+
+@app.get("/wm/list")
+async def wm_list(entity_name: str | None = None, status: str = "open"):
+    """List working-memory tasks, optionally filtered by entity or status."""
+    return await run(mem.tool_wm_list(entity_name=entity_name, status=status))
+
+
+@app.get("/wm/{task_id}")
+async def wm_get_task(task_id: int):
+    """Get all slots and metadata for a working-memory task by id."""
+    return await run(mem.tool_wm_get(task_id=task_id))
+
+
+@app.post("/wm/close")
+async def wm_close(req: WmCloseRequest):
+    """Close a working-memory task, optionally promoting slots to long-term memory."""
+    return await run(mem.tool_wm_close(**req.model_dump()))
+
+
+# ── Session search + token-budget context ─────────────────────────────────────
+
+@app.post("/search_sessions")
+async def search_sessions(req: SearchSessionsRequest):
+    """
+    Full-text keyword search across session turn content (FTS5/BM25).
+    No embedding model required.
+    """
+    return await run(mem.tool_search_sessions(**req.model_dump()))
+
+
+@app.post("/get_context_budget")
+async def get_context_budget(req: GetContextBudgetRequest):
+    """Token-budget-aware context snapshot. Use recall_mode='keyword' for Pi environments."""
+    return await run(mem.tool_get_context_budget(**req.model_dump()))
+
+
+# ── Prospective / intention memory ─────────────────────────────────────────────
+
+@app.post("/intend")
+async def intend(req: IntendRequest):
+    """Set a prospective intention: trigger_text → action_text."""
+    return await run(mem.tool_intend(**req.model_dump()))
+
+
+@app.post("/check_intentions")
+async def check_intentions(req: CheckIntentionsRequest):
+    """Check whether text triggers any active intentions for an entity."""
+    return await run(mem.tool_check_intentions(**req.model_dump()))
+
+
+@app.post("/dismiss_intention")
+async def dismiss_intention(req: DismissIntentionRequest):
+    """Deactivate an intention by id."""
+    return await run(mem.tool_dismiss_intention(**req.model_dump()))
+
+
+@app.get("/intentions")
+async def list_intentions(entity_name: str | None = None, active_only: bool = True):
+    """List intentions, optionally filtered by entity."""
+    return await run(mem.tool_list_intentions(entity_name=entity_name, active_only=active_only))
+
+
 # ── Tier 2 — Time-series endpoints ────────────────────────────────────────────
 
 @app.post("/record")
@@ -549,11 +704,21 @@ async def fading_memories(
 class BulkRecordRequest(BaseModel):
     readings: list[RecordRequest]
 
+_TRUST_FIELD = Field(
+    default=None, ge=1, le=5,
+    description=(
+        "Override source trust tier for imported memories. "
+        "5=user, 4=hardware, 3=system, 2=inferred, 1=external. "
+        "Defaults to MEMORY_TRUST_DEFAULT_IMPORT (env var, default 1)."
+    ),
+)
+
 class ImportJSONLRequest(BaseModel):
     content: str = Field(
         description="Raw JSONL text (one JSON object per line). Max 5 MB.",
         max_length=5 * 1024 * 1024,
     )
+    source_trust: int | None = _TRUST_FIELD
 
 class ImportMem0Request(BaseModel):
     user_id: str = Field(description="mem0 user identifier; becomes the entity name")
@@ -565,6 +730,7 @@ class ImportMem0Request(BaseModel):
     agent_id: str | None = None
     app_id: str | None = None
     entity_type: str = "person"
+    source_trust: int | None = _TRUST_FIELD
 
 class ImportMCPMemoryServiceRequest(BaseModel):
     db_path: str = Field(
@@ -575,6 +741,7 @@ class ImportMCPMemoryServiceRequest(BaseModel):
         description="Entity name in memory-mcp to receive all imported memories",
     )
     entity_type: str = "person"
+    source_trust: int | None = _TRUST_FIELD
 
 class ImportMarkdownRequest(BaseModel):
     files: dict[str, str] = Field(
@@ -637,7 +804,7 @@ async def import_jsonl_endpoint(req: ImportJSONLRequest):
         {"added": int, "skipped": int, "errors": [...], "ok": true}
     """
     try:
-        result = await import_jsonl(req.content)
+        result = await import_jsonl(req.content, source_trust=req.source_trust)
         return {**result.to_dict(), "ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

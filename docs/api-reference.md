@@ -40,7 +40,7 @@ and for monitoring when the SDK is updated to a new protocol version.
   "mcp_sdk_version": "1.26.0",
   "mcp_protocol_version": "2025-11-25",
   "mcp_default_negotiated_version": "2025-03-26",
-  "tool_count": 20,
+  "tool_count": 31,
   "tools": [
     {"name": "remember",    "description": "Store a semantic fact/memory about any entity."},
     {"name": "recall",      "description": "Semantic search across all stored memories."},
@@ -122,8 +122,9 @@ Automatically detects and supersedes contradicting memories.
 
 ### `POST /recall`
 
-Semantic search for memories. Results ranked by cosine similarity × recency × confidence.
-Superseded memories are always excluded.
+Search memories. Three retrieval modes available: vector (semantic), keyword
+(FTS5/BM25), or hybrid (both paths merged). Superseded memories are always
+excluded.
 
 **Request:**
 ```json
@@ -132,7 +133,8 @@ Superseded memories are always excluded.
   "query":           "temperature preferences at night",
   "top_k":           5,
   "recency_weight":  0.0,
-  "min_confidence":  0.5
+  "min_confidence":  0.5,
+  "mode":            "hybrid"
 }
 ```
 
@@ -144,6 +146,16 @@ Superseded memories are always excluded.
 | `top_k` | int | no | `5` | Maximum results to return |
 | `recency_weight` | float | no | `0.0` | 0.0 = pure semantic, 1.0 = strong recency bias |
 | `min_confidence` | float | no | `0.0` | Filter out memories below this confidence |
+| `min_trust` | int | no | `0` | Exclude memories below this trust tier (0=all, 1=external+, 3=system+, 5=user only) |
+| `mode` | string | no | `"vector"` | Retrieval mode: `"vector"` (cosine similarity), `"keyword"` (FTS5/BM25, no embedding needed), `"hybrid"` (both paths merged by max score) |
+
+**Retrieval modes:**
+
+| Mode | Embedding required | Best for |
+|---|---|---|
+| `vector` | Yes | Semantic / natural-language queries |
+| `keyword` | No | Exact terms, Pi/low-resource, offline |
+| `hybrid` | Yes | Best overall recall |
 
 **Response:**
 ```json
@@ -593,6 +605,286 @@ Extract structured facts from free text using the configured LLM and store them 
 **Response:** `{"result": "Extracted and stored 2 fact(s) for 'Brian'.", "ok": true}`
 
 **Note:** Requires a running Ollama instance (or configured LLM backend). If the LLM is unavailable, the tool catches the exception and returns `"result": "Extraction failed: ..."` with HTTP 200 — it does not raise a 500.
+
+---
+
+## Working Memory
+
+Working memory is a task-scoped scratchpad for transient agent state. Slots
+can be set and read during a task, and optionally promoted to long-term semantic
+memory when the task closes.
+
+### `POST /wm/open`
+
+Open a new working-memory task. Returns an integer `task_id`.
+
+**Request:**
+```json
+{
+  "task_name":   "plan grocery run",
+  "entity_name": "Brian",
+  "ttl_seconds": 3600
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `task_name` | string | yes | — | Human-readable label for this task |
+| `entity_name` | string | no | `null` | Associate with an existing entity |
+| `ttl_seconds` | int | no | `null` | Auto-expire after N seconds; omit for no expiry |
+
+**Response:** `{"result": 7, "ok": true}` — `result` is the integer `task_id`.
+
+---
+
+### `POST /wm/set`
+
+Write or overwrite a key/value slot in an open task.
+
+**Request:**
+```json
+{"task_id": 7, "key": "items", "value": ["milk", "eggs"]}
+```
+
+**Response:** `{"result": "Set items in task 7.", "ok": true}`
+
+Returns an error if the task is closed or does not exist.
+
+---
+
+### `POST /wm/get`
+
+Read one slot by key, or all slots with task metadata (omit `key`).
+
+**Request (single slot):**
+```json
+{"task_id": 7, "key": "items"}
+```
+
+**Request (all slots):**
+```json
+{"task_id": 7}
+```
+
+**Response (all slots):**
+```json
+{
+  "result": "Task 7 — plan grocery run (open)\nEntity: Brian\n  items: [\"milk\", \"eggs\"]",
+  "ok": true
+}
+```
+
+---
+
+### `GET /wm/list`
+
+List working-memory tasks.
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `status` | string | `"open"` | `open`, `closed`, `expired`, or `all` |
+| `entity_name` | string | `null` | Scope to one entity |
+
+**Response:** Formatted text listing task IDs, names, statuses, and slot counts.
+
+---
+
+### `GET /wm/{task_id}`
+
+Get all slots and metadata for a specific task. Auth required.
+
+---
+
+### `POST /wm/close`
+
+Close a task. If `promote=true` and the task has an entity, all slots are
+bundled into a long-term semantic memory at `TRUST_INFERRED`.
+
+**Request:**
+```json
+{"task_id": 7, "promote": true}
+```
+
+**Response:** `{"result": "Closed task 7. Promoted 2 slot(s) to long-term memory for Brian.", "ok": true}`
+
+---
+
+## Session Search
+
+### `POST /search_sessions`
+
+Full-text keyword search across all session turn content (FTS5/BM25). No
+embedding model required — suitable for Raspberry Pi or any environment without
+Ollama.
+
+Pass substantive keywords, not full questions. The FTS5 index uses the Porter
+stemmer so "running" matches "run", "runs", etc.
+
+**Request:**
+```json
+{
+  "query":       "grocery shopping meal planning",
+  "entity_name": "Brian",
+  "limit":       5
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `query` | string | yes | — | Keywords to search (not a full question) |
+| `entity_name` | string | no | `null` | Scope to one entity; omit to search all |
+| `limit` | int | no | `10` | Maximum results (1–100) |
+
+**Response:**
+```json
+{
+  "result": "Session search [keyword/FTS5] for 'grocery shopping':\n\n1. Session 42 — Brian | 2026-03-22 10:30\n   Summary: Brian discussed grocery shopping.\n   Match: '...I need to pick up groceries tomorrow...'",
+  "ok": true
+}
+```
+
+---
+
+## Token-Budget Context
+
+### `POST /get_context_budget`
+
+Token-budget-aware context snapshot. Greedily fills a token limit with ranked
+memories, readings, and relations — stopping when the budget is exhausted. The
+`truncated` field in the result indicates whether any items were omitted.
+
+Ideal for models with small context windows or for Raspberry Pi deployments.
+Use `recall_mode="keyword"` to skip the embedding call entirely.
+
+**Request:**
+```json
+{
+  "entity_name":    "Brian",
+  "context_query":  "how is Brian feeling today?",
+  "token_budget":   1200,
+  "recall_mode":    "hybrid",
+  "include_readings": true
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entity_name` | string | yes | — | Entity to fetch context for |
+| `context_query` | string | yes | — | Used to rank which memories to surface |
+| `token_budget` | int | no | `1500` | Maximum tokens (50–32000; 1 token ≈ 4 chars) |
+| `recall_mode` | string | no | `"hybrid"` | `"vector"`, `"keyword"`, or `"hybrid"` |
+| `include_readings` | bool | no | `true` | Include latest sensor readings |
+
+**Response:**
+```json
+{
+  "result": "=== Context: Brian (token budget: 1200) ===\n\n[MEMORIES]\n- [preference] Prefers 68°F at night (conf=0.95)\n- [habit] Usually home by 6pm (conf=0.88)\n\n[READINGS]\n- mood: calm (just now)\n\n[RELATIONS]\n- lives_in → house\n\n(truncated: false)",
+  "ok": true
+}
+```
+
+The response always ends with `(truncated: true)` or `(truncated: false)` to
+tell the caller whether the budget was exhausted before all items were included.
+
+---
+
+## Prospective / Intention Memory
+
+Prospective memory stores **what to do** when a condition is met — not what
+happened or what is known. Intentions are matched against conversation text using
+FTS5/BM25 at the start of each user turn, with no embedding model required.
+
+### `POST /intend`
+
+Store a prospective intention for an entity.
+
+**Request:**
+```json
+{
+  "entity_name":  "Brian",
+  "trigger_text": "shopping groceries food store",
+  "action_text":  "Remind Brian to buy milk",
+  "entity_type":  "person",
+  "expires_ts":   1750000000
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entity_name` | string | yes | — | Entity this intention belongs to |
+| `trigger_text` | string | yes | — | Keywords that activate this intention (FTS5-indexed) |
+| `action_text` | string | yes | — | What to do when the condition is met |
+| `entity_type` | string | no | `"person"` | Used only when creating a new entity |
+| `expires_ts` | float | no | `null` | Unix timestamp after which intention expires; omit for no expiry |
+
+**Response:** `{"result": "Intention 3 stored for Brian.", "ok": true}` — `result` includes the integer intention ID.
+
+---
+
+### `POST /check_intentions`
+
+Check whether the given text triggers any active intentions for an entity.
+Returns matched intentions with their `action_text`. Call this at the start of
+each user turn.
+
+**Request:**
+```json
+{"entity_name": "Brian", "text": "I need to go to the grocery store tomorrow"}
+```
+
+**Response (match found):**
+```json
+{
+  "result": "1 active intention matched for Brian:\n\n[intention 3] Remind Brian to buy milk\n  trigger: shopping groceries food store\n  fired 2 time(s)",
+  "ok": true
+}
+```
+
+**Response (no match):**
+```json
+{"result": "No active intentions matched for Brian.", "ok": true}
+```
+
+Each match increments the `fired_count` for that intention. Expired
+(`expires_ts` in the past) and dismissed (`active=0`) intentions are never
+returned.
+
+---
+
+### `POST /dismiss_intention`
+
+Deactivate an intention so it is no longer matched. The row is preserved for
+history (soft-delete — `active` set to `0`).
+
+**Request:**
+```json
+{"intention_id": 3}
+```
+
+**Response:** `{"result": "Intention 3 dismissed.", "ok": true}`
+
+---
+
+### `GET /intentions`
+
+List intentions, optionally filtered by entity and active status.
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `entity_name` | string | `null` | Scope to one entity |
+| `active_only` | bool | `true` | If `false`, include dismissed and expired intentions |
+
+**Response:**
+```json
+{
+  "result": "Intentions for Brian (active only):\n\n[intention 3] active\n  trigger: shopping groceries food store\n  action:  Remind Brian to buy milk\n  fired: 2 time(s), created: 2026-03-22",
+  "ok": true
+}
+```
 
 ---
 

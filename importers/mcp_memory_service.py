@@ -89,6 +89,7 @@ async def import_mcp_memory_service(
     db_path: str,
     entity_name: str = "imported",
     entity_type: str = "person",
+    source_trust: int | None = None,
 ) -> ImportResult:
     """
     Import memories from a mcp-memory-service SQLite database.
@@ -108,6 +109,12 @@ async def import_mcp_memory_service(
     name = sanitize_name(entity_name)
     if not name:
         raise ValueError(f"Invalid entity_name: {entity_name!r}")
+
+    trust = (
+        max(mem.TRUST_EXTERNAL, min(mem.TRUST_USER, int(source_trust)))
+        if source_trust is not None
+        else mem.TRUST_DEFAULT_IMPORT
+    )
 
     result = ImportResult()
 
@@ -204,9 +211,9 @@ async def import_mcp_memory_service(
         vec = await mem.embed(fact)
         cur = dst_db.execute(
             """INSERT INTO memories
-                   (entity_id, fact, category, confidence, source, created, updated)
-               VALUES (?, ?, 'general', 1.0, ?, ?, ?)""",
-            (eid, fact, _SOURCE_TAG, now, now),
+                   (entity_id, fact, category, confidence, source, source_trust, created, updated)
+               VALUES (?, ?, 'general', 1.0, ?, ?, ?, ?)""",
+            (eid, fact, _SOURCE_TAG, trust, now, now),
         )
         mid = cur.lastrowid
         dst_db.execute(

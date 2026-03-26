@@ -350,6 +350,7 @@ async def entity_remember(
             fact=fact,
             category=category,
             source="admin_ui",
+            source_trust=mem.TRUST_USER,
         )
     except Exception as exc:
         return HTMLResponse(

@@ -39,65 +39,241 @@ This is what it looks like when an AI home actually *knows* you.
 
 ---
 
-## Motivation
+## Application design
 
-Modern AI assistants are stateless by design. Every MCP tool call, every Home
-Assistant automation, every voice interaction starts with a blank slate. The
-large language models powering these abilities are brilliant at reasoning — but
-they cannot remember yesterday, let alone last month.
+### Architecture: five tiers
 
-The standard workaround is to dump everything into a system prompt and hope it
-fits in the context window. That approach breaks under the weight of a real home
-with real history.
+```
+Tier 1   — Semantic memory      entities, facts, relations, vector embeddings
+Tier 1.5 — Episodic memory      conversation sessions, turn-by-turn transcripts
+Tier 1.75 — Working memory      task-scoped transient scratchpads with TTL
+Tier 2   — Time-series store    readings (numeric/categorical/composite), rollups, schedule
+Tier 3   — Pattern engine       background task: promotes stable trends → Tier 1 memories
+```
 
-memory-mcp was built to solve this properly:
+The pattern engine closes the loop: raw sensor data (Tier 2) automatically
+becomes searchable, natural-language memory ("Brian's temperature preference is
+consistently 68°F") that any ability can recall semantically (Tier 1).
 
-- **Semantic search, not keyword grep.** Facts are embedded as vectors. Ask
-  "does Brian have any dietary restrictions?" and the system finds "is
-  vegetarian", even if that exact phrase was never used.
-- **Structured sensor history, not a log file.** Time-series readings are stored
-  in a tiered system — raw readings roll up into hourly, daily, and weekly
-  aggregates. You can ask for the last hour or the last month with the same call.
-- **Automatic pattern promotion.** A background engine watches the sensor stream
-  and promotes stable patterns — consistent temperatures, time-of-day habits,
-  anomalies, correlations — directly into the semantic memory layer. The system
-  learns without you teaching it.
-- **Works with what you already have.** HTTP API, MCP stdio transport, MQTT
-  bridge. If it can send a webhook, it can feed memory-mcp.
+### Storage
+
+Everything lives in a single SQLite file with two extensions:
+
+- **sqlite-vec** — vector similarity search (cosine distance over FLOAT[768]
+  embeddings). Every memory fact is embedded into a 768-dimensional vector for
+  semantic recall.
+- **FTS5** — full-text search with BM25 ranking. Three FTS5 virtual tables
+  index memory facts, session turn content, and intention trigger text. Enables
+  keyword recall with no embedding model required — ideal for Raspberry Pi or
+  any environment without a GPU.
+
+### AI backend
+
+memory-mcp uses the OpenAI-compatible API (`/v1/embeddings` +
+`/v1/chat/completions`). It works with Ollama, OpenAI, LM Studio, Together AI,
+or any compatible provider. Configure via environment variables — no code
+changes needed.
+
+### Interfaces
+
+Two interfaces are available simultaneously:
+
+- **MCP stdio server** (`server.py`) — 31 tools exposed over the Model Context
+  Protocol. Connect any MCP-compatible AI framework.
+- **HTTP API + admin UI** (`api.py`) — FastAPI server on port 8900 with REST
+  endpoints, auto-generated Swagger docs at `/docs`, and a web dashboard at
+  `/admin/`.
+
+---
+
+## Memory types
+
+memory-mcp covers six of the seven major memory types studied in cognitive
+science and AI memory research. Each type maps directly to one or more storage
+tiers and retrieval tools.
+
+### 1. Semantic memory (long-term factual)
+
+Timeless facts about entities: preferences, habits, relationships, insights.
+
+- **Storage:** Tier 1 — `memories` table + `memory_vectors` (sqlite-vec)
+- **Write:** `remember` / `extract_and_remember` / pattern engine promotions
+- **Read:** `recall` (vector, keyword, or hybrid), `get_context`, `get_profile`,
+  `cross_query`, `get_context_budget`
+- **Notable:** Multi-factor ranking (cosine × recency × confidence). Automatic
+  contradiction detection supersedes outdated facts. Trust-tiered writes
+  prevent low-trust sources from overwriting high-trust memories.
+  Confidence decays over time; stale memories surfaced via `get_fading_memories`.
+
+### 2. Episodic memory (autobiographical)
+
+What happened, when, and with whom — full conversation transcripts with
+LLM-generated summaries.
+
+- **Storage:** Tier 1.5 — `sessions` + `session_turns` tables + `session_turns_fts`
+- **Write:** `open_session`, `log_turn`, `close_session`
+- **Read:** `get_session`, `search_sessions` (FTS5/BM25 keyword search across
+  all turn content)
+- **Notable:** The pattern engine automatically **consolidates** closed sessions
+  — it sends the transcript to the LLM, extracts key facts, and promotes them
+  to Tier 1 semantic memory. Raw transcripts become queryable facts without any
+  manual curation step.
+
+### 3. Working memory (transient task state)
+
+Short-lived scratchpads for multi-step agent tasks. Slots expire automatically
+via TTL. Can be promoted to long-term semantic memory on close.
+
+- **Storage:** Tier 1.75 — `working_memory_tasks` + `working_memory_slots`
+- **Write:** `wm_open`, `wm_set`
+- **Read:** `wm_get`, `wm_list`
+- **Lifecycle:** `wm_close` (optionally promotes all slots to Tier 1)
+- **Notable:** Bridges the gap between in-context state (lost when context
+  window fills) and long-term memory (too slow to write for every step). An
+  agent can maintain a slot like `{preferred_format: "bullet points"}` across
+  multiple tool calls within a session, then promote it to a memory at the end.
+
+### 4. Procedural memory (learned patterns)
+
+Stable patterns extracted automatically from the sensor stream — the system
+learns behaviours without being explicitly taught.
+
+- **Storage:** Tier 1 (`memories`) via `promoted_patterns` deduplication table
+- **Write:** Pattern engine (background, hourly) — `_promote_patterns()`
+- **Read:** Same as semantic memory — facts are fully searchable
+- **Detectors:** stable average, trend (rising/falling), dominant categorical,
+  time-of-day, anomaly, cross-metric correlation
+- **Example promotions:**
+  - "Brian's resting heart rate is consistently 62 bpm"
+  - "Brian's mood is predominantly 'focused' (78% of days)"
+  - "Brian's presence is 'home' at 19:00 (91% of readings)"
+  - "Anomaly: bedroom temperature was 88°F at 14:30 (4.1 std devs above normal)"
+  - "Brian's heart_rate and stress_level are positively correlated (r=0.84)"
+
+### 5. Prospective memory (intentions — novel approach)
+
+Future-oriented: "when X happens, do Y." This is memory about *what to do*,
+not what happened or what is known.
+
+- **Storage:** Tier 4 — `intentions` table + `intentions_fts` (FTS5 index on
+  `trigger_text`)
+- **Write:** `intend` — stores a `(trigger_text, action_text)` pair with an
+  optional `expires_ts`
+- **Read:** `check_intentions` — FTS5/BM25 match against the current
+  conversation text; increments `fired_count` on each match;
+  `list_intentions` — enumerate active or all intentions for an entity
+- **Dismiss:** `dismiss_intention` — soft-deactivate; row preserved for history
+- **Why it's novel:** Most memory systems store what happened. Prospective
+  memory stores what *should happen* — making it possible for an AI ability to
+  act on user-expressed intentions ("remind me to buy milk when I mention
+  shopping") without relying on the user to repeat themselves every session.
+  The FTS5 trigger match is lightweight and requires no embedding model, so it
+  fires reliably even on resource-constrained devices.
+
+**Example workflow:**
+```python
+# User says: "next time I ask about recipes, mention I'm vegetarian"
+await mem.tool_intend(
+    entity_name="Brian",
+    trigger_text="recipe cooking meal food ingredient",
+    action_text="Brian is vegetarian — do not suggest meat-based recipes",
+)
+
+# Later, at the start of each user turn:
+matches = await mem.tool_check_intentions("Brian", "what can I make for dinner?")
+# → Returns the vegetarian intention, fired_count incremented
+```
+
+### 6. Sensory / short-term buffer
+
+Raw time-series readings before pattern extraction — numeric, categorical, or
+composite sensor data with full rollup history.
+
+- **Storage:** Tier 2 — `readings`, `reading_rollups`, `schedule_events`
+- **Write:** `record`, `record/bulk`
+- **Read:** `query_stream` (raw or hourly/daily/weekly rollup), `get_trends`
+- **Retention:** Raw readings pruned after `RETENTION_DAYS` (default: 30 days).
+  Rollups are never pruned — aggregates survive indefinitely.
+
+### What's not covered
+
+**Spatial memory** (navigate a physical layout, remember object locations) is
+out of scope — memory-mcp is a knowledge and pattern store, not a navigation or
+robotics layer.
+
+---
+
+## Retrieval modes
+
+memory-mcp offers three retrieval modes, selectable per query:
+
+| Mode | How it works | Best for |
+|---|---|---|
+| `vector` | Cosine similarity via sqlite-vec; requires embedding model | Semantic / natural-language queries |
+| `keyword` | BM25/FTS5 full-text search; no embedding model needed | Exact terms, Pi/low-resource, fast lookup |
+| `hybrid` | Both paths run in parallel; scores normalised and merged by max | Best recall overall (default) |
+
+**Why FTS5?** Large language models construct agent queries using the actual
+vocabulary of the stored facts, not paraphrases. BM25 often outperforms pure
+vector search in this regime. FTS5 also works offline with no Ollama instance —
+important for Raspberry Pi deployments.
+
+**Token-budget context assembly** (`get_context_budget`) is a greedy fill
+algorithm that ranks available memories and readings by relevance, then adds
+them to the response until a token budget is exhausted. The `truncated` flag
+tells the caller whether any items were omitted. Use `recall_mode="keyword"` for
+Pi environments to skip the embedding call entirely.
+
+---
+
+## Trust and contradiction handling
+
+Every stored memory carries a `source_trust` tier:
+
+| Tier | Label | Example sources |
+|---|---|---|
+| 5 | `user` | Direct user statements, manual entries |
+| 4 | `hardware` | Verified sensors, signed device data |
+| 3 | `system` | Pattern engine promotions, LLM extraction |
+| 2 | `inferred` | Working memory promotions, low-confidence extractions |
+| 1 | `external` | Third-party imports, unverified webhooks |
+
+**Cross-check rule:** Before writing a new memory at trust < `user`, the system
+embeds the new fact and searches for any existing memory with higher trust
+within cosine distance 0.15. If found, the write is blocked and returns a
+descriptive message. This prevents sensor noise or external data from
+overwriting things the user explicitly told the system.
+
+**Supersession:** When a higher-trust fact is written that contradicts an older
+lower-trust fact, the older memory is soft-deleted (`superseded_by` set) rather
+than hard-deleted. The old fact remains in the database for audit purposes but
+is excluded from all recall and context queries.
 
 ---
 
 ## How it works
 
-memory-mcp organises everything into four tiers:
+### Pattern engine (Tier 3)
 
-```
-Tier 1 — Semantic memory
-  People, places, things → facts → embedded vectors → instant semantic search
+Runs every hour in the background. For each entity/metric combination with new
+data:
 
-Tier 1.5 — Episodic memory
-  Conversation sessions with full transcripts and LLM-generated summaries
+1. Builds or updates rollups (hourly/daily/weekly aggregates)
+2. Runs all six detectors on the fresh aggregates
+3. Promotes stable findings to Tier 1 semantic memory (deduplicated via
+   `promoted_patterns`)
+4. Decays confidence on older memories (exponential, per-category halflife)
+5. Consolidates closed episodic sessions into Tier 1 facts
+6. Expires working memory tasks past their TTL
+7. Prunes raw readings older than `RETENTION_DAYS`
 
-Tier 2 — Time-series store
-  Raw sensor readings → hourly/daily/weekly rollups → trend queries
+### Episodic consolidation
 
-Tier 3 — Pattern engine (background, runs every hour)
-  Watches Tier 2 → detects stable patterns → writes insight memories to Tier 1
-```
-
-The pattern engine is where memory-mcp earns its keep. It runs four detectors:
-
-| Detector | What it finds | Example |
-|---|---|---|
-| Stable average | A numeric metric that barely changes | "Brian's resting heart rate is consistently 62 bpm" |
-| Trend | A metric that is rising or falling | "Living room CO₂ has been rising (+22% over 6 days)" |
-| Dominant categorical | A state that dominates a metric | "Brian's mood is predominantly 'focused' (78% of days)" |
-| Time-of-day | A state that is consistent at a specific hour | "Brian's presence is 'home' at 19:00 (91% of readings)" |
-| Anomaly | A reading that is 3+ std devs from normal | "Anomaly: bedroom temperature was 88°F at 14:30 (4.1 std devs above normal 69°F)" |
-| Correlation | Two metrics that move together | "Brian's heart_rate and stress_level are positively correlated (r=0.84)" |
-
-Every pattern that gets promoted becomes a semantic memory — searchable by any
-AI ability using natural language, with no SQL required.
+When a session is closed, it is queued for consolidation. The pattern engine
+picks up unconsolidated sessions (up to 20 per cycle), sends a compact
+transcript to the configured LLM, and stores the extracted facts as `inferred`-
+trust semantic memories. Sessions are marked `consolidated=1` after processing
+(even on LLM error, to prevent retry loops).
 
 ---
 
@@ -124,8 +300,12 @@ A well-integrated ability uses memory-mcp like this:
 
 ```python
 # At the start of every session — pull what's relevant right now
-context = await mem.get_context("Brian", context_query="current session topic")
-# → inject into system prompt: Brian's relevant memories, latest readings, schedule
+context = await mem.get_context_budget("Brian", context_query="current session topic",
+                                       token_budget=1200, recall_mode="hybrid")
+# → inject into system prompt
+
+# Check for pending intentions
+matches = await mem.check_intentions("Brian", user_message)
 
 # During conversation — store anything learned
 await mem.remember("Brian", "Prefers responses under 3 sentences when busy",
@@ -134,9 +314,6 @@ await mem.remember("Brian", "Prefers responses under 3 sentences when busy",
 # When the conversation ends — log the full session for future reference
 await mem.close_session(session_id, summary="Discussed travel plans for April")
 ```
-
-The ability gets instant access to relevant personal context without you having
-to manually curate it. It grows richer every session.
 
 Ready-to-use ability files are included in `integrations/openhome/` — a
 background daemon that injects context at session start and extracts new facts
@@ -180,10 +357,6 @@ pattern engine starts surfacing insights you didn't ask for: preferred
 temperatures per room, typical arrival times, energy usage patterns, air quality
 trends.
 
-You can also push semantic facts directly — for example, an HA automation that
-fires when a grocery delivery arrives could call `/remember` to store
-"Brian received a grocery delivery on 2026-03-21".
-
 If you'd rather not modify `configuration.yaml` at all, `integrations/ha_state_poller.py`
 is a standalone script that polls the HA REST API on a schedule and pushes state
 changes automatically — same result, zero HA config changes required.
@@ -191,53 +364,21 @@ changes automatically — same result, zero HA config changes required.
 ### MQTT / IoT devices
 
 The included `integrations/mqtt_bridge.py` is a standalone process that bridges
-any MQTT-speaking device to memory-mcp. This covers:
-
-- **Zigbee2MQTT** — air quality sensors, door sensors, motion sensors, power plugs
-- **Tasmota** devices — temperature, humidity, energy monitoring
-- **ESPHome** nodes — custom sensors, buttons, LED state
-- **Any other MQTT publisher** — if it publishes to a topic, it can feed memory
-
-Configure topic mappings in `mqtt_mappings.json`:
-
-```json
-{
-  "zigbee2mqtt/bedroom_sensor": {
-    "entity": "bedroom",
-    "entity_type": "room",
-    "metrics": {
-      "temperature": {"unit": "F"},
-      "humidity":    {"unit": "%"},
-      "co2":         {"unit": "ppm"}
-    }
-  }
-}
-```
-
-The bridge handles the rest — type detection, entity creation, batching, and
-reconnection. Three readings from a single JSON payload become three independent
-time-series in memory-mcp, each with full rollup and pattern detection.
+any MQTT-speaking device to memory-mcp. This covers Zigbee2MQTT, Tasmota,
+ESPHome, and any other MQTT publisher. Configure topic mappings in
+`mqtt_mappings.json`; the bridge handles type detection, entity creation,
+batching, and reconnection.
 
 ### Other devices and services
 
-Anything that can make an HTTP POST can feed memory-mcp. The API is intentionally
-simple — no authentication complexity for local network use, straightforward JSON
-shapes, and a `/record/bulk` endpoint for batch ingestion.
-
-Some ideas people have wired up or could wire up:
+Anything that can make an HTTP POST can feed memory-mcp. Some ideas:
 
 - **Node-RED** flows pushing sensor aggregates on a schedule
-- **Python scripts** that scrape wearable health data (sleep scores, HRV, steps)
-  and push it as readings for `Brian` — the pattern engine will find the trends
-- **Calendar integrations** that call `/schedule` to keep upcoming events in the
-  memory layer so AI abilities can reference them
-- **Shell scripts** running on a cron that push daily summaries as facts via
-  `/remember`
-- **Wearables via webhook** — Garmin, Oura, Withings all support webhook exports;
-  point them at `/record` and your health data starts building a personal baseline
-- **Voice assistant post-processing** — after each conversation, push a mood
-  composite to `/record` and let the pattern engine build a long-term emotional
-  landscape
+- **Python scripts** scraping wearable health data (sleep scores, HRV, steps)
+- **Calendar integrations** calling `/schedule` to surface upcoming events
+- **Wearables via webhook** — Garmin, Oura, Withings all support webhook exports
+- **Voice assistant post-processing** — push a mood composite to `/record` after
+  each conversation; the pattern engine builds a long-term emotional landscape
 
 ---
 
@@ -245,10 +386,10 @@ Some ideas people have wired up or could wire up:
 
 When you first clone and run memory-mcp, you get:
 
-- A **persistent SQLite database** with full-text and vector search — no separate
-  database server to run
-- A **FastAPI HTTP server** on port 8900 with a clean REST API and auto-generated
-  Swagger docs at `/docs`
+- A **persistent SQLite database** with full-text and vector search — no
+  separate database server to run
+- A **FastAPI HTTP server** on port 8900 with a clean REST API and
+  auto-generated Swagger docs at `/docs`
 - An **admin web dashboard** at `/admin` where you can browse entities, inspect
   memories, watch the readings stream, manage the API token, and prune old data
 - An **MCP stdio server** ready to connect to any MCP-compatible AI framework
@@ -257,7 +398,7 @@ When you first clone and run memory-mcp, you get:
   admin settings page
 - **Docker Compose** for single-command production deployment:
   `docker compose up -d`
-- Full test suite (336 tests, no Ollama or internet connection required to run)
+- Full test suite (682 tests, no Ollama or internet connection required to run)
 - Comprehensive documentation covering every aspect of installation, operation,
   and extension
 
@@ -273,6 +414,13 @@ data leaving your home.
 It works with a local [Ollama](https://ollama.ai) instance for embeddings and
 LLM inference, and it is fully compatible with any OpenAI-compatible provider if
 you prefer cloud models. Switching providers is one environment variable.
+
+It also runs on a **Raspberry Pi**. The keyword retrieval mode (`recall_mode=
+"keyword"`) bypasses the embedding model entirely — FTS5/BM25 search works with
+no GPU, no Ollama, and no network access. The token-budget context tool
+(`get_context_budget`) keeps responses within the limits of smaller models by
+greedily filling a configurable token budget and signalling when items were
+omitted.
 
 ---
 
@@ -332,5 +480,8 @@ finds the answer.
 
 > "When is Brian usually home?"
 > → "Brian's presence is 'home' at 18:00 (88% of 21 readings), 19:00 (94% of 21 readings)"
+
+> "next time I mention shopping, remind me about milk"
+> → Stored as a prospective intention — fires automatically the next time "shopping" or related words appear in conversation
 
 That is what a home that knows you feels like. And it runs on a Raspberry Pi.

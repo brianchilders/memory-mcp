@@ -34,7 +34,10 @@ _MAX_LINES         = 10_000             # truncate after this many lines
 _SOURCE_TAG        = "import:jsonl"
 
 
-async def import_jsonl(content: str) -> ImportResult:
+async def import_jsonl(
+    content: str,
+    source_trust: int | None = None,
+) -> ImportResult:
     """
     Parse and import JSONL content into memory-mcp.
 
@@ -52,6 +55,12 @@ async def import_jsonl(content: str) -> ImportResult:
         raise ValueError(
             f"JSONL content exceeds {_MAX_CONTENT_BYTES // 1024 // 1024} MB limit"
         )
+
+    trust = (
+        max(mem.TRUST_EXTERNAL, min(mem.TRUST_USER, int(source_trust)))
+        if source_trust is not None
+        else mem.TRUST_DEFAULT_IMPORT
+    )
 
     result   = ImportResult()
     entities: list[tuple[int, dict]] = []
@@ -131,9 +140,9 @@ async def import_jsonl(content: str) -> ImportResult:
             vec = await mem.embed(fact)
             cur = db.execute(
                 """INSERT INTO memories
-                       (entity_id, fact, category, confidence, source, created, updated)
-                   VALUES (?, ?, 'general', 1.0, ?, ?, ?)""",
-                (eid, fact, _SOURCE_TAG, now, now),
+                       (entity_id, fact, category, confidence, source, source_trust, created, updated)
+                   VALUES (?, ?, 'general', 1.0, ?, ?, ?, ?)""",
+                (eid, fact, _SOURCE_TAG, trust, now, now),
             )
             mid = cur.lastrowid
             db.execute(

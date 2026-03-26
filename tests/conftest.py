@@ -48,3 +48,19 @@ def mock_embed(monkeypatch):
         return [x / norm for x in vec]
 
     monkeypatch.setattr(mem, "embed", fake_embed)
+
+
+_FIXED_VEC = [1.0] + [0.0] * (mem.EMBED_DIM - 1)
+
+
+@pytest.fixture
+def same_embedding(monkeypatch):
+    """Patch embed() to return the same unit vector for every call.
+    Forces cosine similarity = 1.0 for all pairs, making every fact look like
+    a near-duplicate of every other — allowing trust and conflict rules to be
+    tested in isolation without depending on semantic proximity.
+    """
+    async def _fixed_embed(text: str) -> list[float]:
+        return _FIXED_VEC
+
+    monkeypatch.setattr(mem, "embed", _fixed_embed)
