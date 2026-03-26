@@ -82,6 +82,29 @@ PATTERN_INTERVAL        = 3600   # seconds between pattern engine runs
 RETENTION_DAYS          = 30     # raw readings older than this are deleted by _prune_readings()
 CONTRADICTION_THRESHOLD = 0.85   # cosine similarity above which an older memory is superseded
 
+# ── Confidence decay (Feature 5) ───────────────────────────────────────────────
+#
+# Memories decay exponentially towards a floor of 0.05 based on time since last
+# access.  The global half-life can be overridden per category.
+#
+# MEMORY_DECAY_HALFLIFE_DAYS   = 90  (days until confidence halves; 0 disables)
+# MEMORY_DECAY_CATEGORY_HALFLIFE = {"habit":30,"routine":45}  (JSON dict, optional)
+#
+# Formula: new_conf = max(0.05, conf × exp(-ln(2) × days_since_access / halflife))
+# Decay runs in the pattern engine loop alongside rollups/patterns/prune.
+
+_decay_halflife_global: float = float(os.environ.get("MEMORY_DECAY_HALFLIFE_DAYS", "90"))
+_decay_halflife_by_category: dict[str, float] = {}
+_raw = os.environ.get("MEMORY_DECAY_CATEGORY_HALFLIFE", "")
+if _raw:
+    try:
+        _decay_halflife_by_category = {k: float(v) for k, v in json.loads(_raw).items()}
+    except Exception:
+        pass  # misconfigured — fall back to global only
+
+DECAY_CONFIDENCE_FLOOR = 0.05
+DECAY_RECALL_BOOST     = 0.05   # confidence nudge applied when a memory is recalled
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 #
 # MEMORY_LOG_LEVEL  = DEBUG | INFO | WARNING | ERROR  (default: INFO)
@@ -675,12 +698,15 @@ async def tool_recall(
     scored.sort(key=lambda x: x[0], reverse=True)
     scored = scored[:top_k]
 
-    # Update access tracking for returned memories only
+    # Update access tracking + apply recall confidence boost for returned memories
     now = time.time()
     for _, r in scored:
+        new_conf = min(1.0, r["confidence"] + DECAY_RECALL_BOOST)
         db.execute(
-            "UPDATE memories SET last_accessed=?, access_count=access_count+1 WHERE id=?",
-            (now, r["id"]),
+            """UPDATE memories
+               SET last_accessed=?, access_count=access_count+1, confidence=?
+               WHERE id=?""",
+            (now, new_conf, r["id"]),
         )
     db.commit()
     db.close()
@@ -1722,6 +1748,50 @@ async def _promote_patterns():
     db.close()
 
 
+async def _decay_memories() -> int:
+    """
+    Apply exponential confidence decay to all non-superseded memories.
+
+    Uses last_accessed (falling back to updated) as the reference timestamp.
+    Each category uses its configured half-life; global default applies when no
+    per-category override is set.  Decay is skipped entirely when the global
+    half-life is 0.  Confidence is clamped to DECAY_CONFIDENCE_FLOOR (0.05).
+
+    Returns the number of memories whose confidence changed.
+    """
+    if _decay_halflife_global <= 0:
+        return 0
+
+    db = get_db()
+    rows = db.execute(
+        """SELECT id, category, confidence,
+                  COALESCE(last_accessed, updated) AS ref_ts
+           FROM memories
+           WHERE superseded_by IS NULL""",
+    ).fetchall()
+
+    now    = time.time()
+    updated = 0
+    for row in rows:
+        halflife = _decay_halflife_by_category.get(row["category"], _decay_halflife_global)
+        if halflife <= 0:
+            continue
+        days_since = (now - row["ref_ts"]) / 86400.0
+        decayed    = row["confidence"] * math.exp(-math.log(2) * days_since / halflife)
+        new_conf   = max(DECAY_CONFIDENCE_FLOOR, decayed)
+        if abs(new_conf - row["confidence"]) > 0.001:
+            db.execute(
+                "UPDATE memories SET confidence=? WHERE id=?",
+                (round(new_conf, 4), row["id"]),
+            )
+            updated += 1
+
+    db.commit()
+    db.close()
+    log.info(f"Decay: updated confidence on {updated} memories.")
+    return updated
+
+
 async def _prune_readings() -> int:
     """
     Delete raw readings older than RETENTION_DAYS.
@@ -1818,6 +1888,64 @@ async def _consolidate_memories() -> int:
     return total_superseded
 
 
+async def tool_get_fading_memories(
+    entity_name: str | None = None,
+    threshold: float = 0.5,
+    limit: int = 20,
+) -> str:
+    """
+    Return memories whose confidence has fallen below `threshold`, ordered by
+    confidence ascending (most faded first).  Useful for surfacing stale facts
+    that may need review, reinforcement, or deletion.
+
+    Parameters
+    ----------
+    entity_name : str, optional
+        Scope to a single entity.  Omit to search all entities.
+    threshold   : float (default 0.5)
+        Only memories with confidence < threshold are returned.
+    limit       : int (default 20)
+        Maximum number of rows to return.
+    """
+    db = get_db()
+    if entity_name:
+        rows = db.execute(
+            """SELECT m.id, e.name AS entity, m.category, m.fact, m.confidence,
+                      m.last_accessed, m.updated
+               FROM memories m
+               JOIN entities e ON e.id = m.entity_id
+               WHERE e.name=? AND m.confidence < ? AND m.superseded_by IS NULL
+               ORDER BY m.confidence ASC
+               LIMIT ?""",
+            (entity_name, threshold, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT m.id, e.name AS entity, m.category, m.fact, m.confidence,
+                      m.last_accessed, m.updated
+               FROM memories m
+               JOIN entities e ON e.id = m.entity_id
+               WHERE m.confidence < ? AND m.superseded_by IS NULL
+               ORDER BY m.confidence ASC
+               LIMIT ?""",
+            (threshold, limit),
+        ).fetchall()
+    db.close()
+
+    if not rows:
+        scope = f" for {entity_name!r}" if entity_name else ""
+        return f"No fading memories{scope} below confidence {threshold}."
+
+    lines = [f"Fading memories (confidence < {threshold}):\n"]
+    for r in rows:
+        last = _age_label(r["last_accessed"] or r["updated"])
+        lines.append(
+            f"  [id={r['id']}] {r['entity']} / {r['category']}  "
+            f"conf={round(r['confidence'], 3)}  last_accessed={last}  {r['fact']}"
+        )
+    return "\n".join(lines)
+
+
 async def pattern_engine_loop():
     """Background task: build rollups, detect patterns, and prune old readings."""
     await asyncio.sleep(60)   # let server settle before first run
@@ -1831,6 +1959,8 @@ async def pattern_engine_loop():
             n = await _consolidate_memories()
             if n:
                 log.info(f"Pattern engine: consolidated {n} near-duplicate memories.")
+            log.info("Pattern engine: decaying memory confidence…")
+            await _decay_memories()
             log.info("Pattern engine: pruning old readings…")
             await _prune_readings()
             db = get_db()
@@ -1976,6 +2106,18 @@ TOOLS = [
              "Rollups and memories are preserved. Returns count of deleted rows."
          ),
          inputSchema={"type":"object","properties":{}}),
+    Tool(name="get_fading_memories",
+         description=(
+             "Return memories whose confidence has fallen below a threshold — "
+             "most faded first. Useful for surfacing stale facts that may need "
+             "review or reinforcement. Decay runs hourly in the pattern engine."
+         ),
+         inputSchema={"type":"object","properties":{
+             "entity_name":{"type":"string",
+                 "description":"Scope to one entity; omit for all entities"},
+             "threshold":{"type":"number","default":0.5,
+                 "description":"Return memories with confidence below this value"},
+             "limit":{"type":"integer","default":20}}}),
 ]
 
 
@@ -2004,7 +2146,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "log_turn":      tool_log_turn,
         "close_session": tool_close_session,
         "get_session":   tool_get_session,
-        "prune":         tool_prune,
+        "prune":                tool_prune,
+        "get_fading_memories":  tool_get_fading_memories,
     }
     fn = dispatch.get(name)
     if not fn:

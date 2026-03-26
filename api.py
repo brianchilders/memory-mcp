@@ -27,7 +27,7 @@ Endpoints:
     POST /record                POST /record/bulk
     POST /query_stream          POST /get_trends
     POST /schedule              POST /cross_query
-    POST /prune
+    POST /prune                 GET  /fading
 
     GET  /graph                 GET  /api/graph
     GET  /export/markdown       GET  /export/markdown/{name}
@@ -270,6 +270,11 @@ class CrossQueryRequest(BaseModel):
     query: str
     top_k: int = 5
 
+class FadingRequest(BaseModel):
+    entity_name: str | None = None
+    threshold: float = 0.5
+    limit: int = 20
+
 class OpenSessionRequest(BaseModel):
     entity_name: str
     entity_type: str = "person"
@@ -469,6 +474,27 @@ async def prune():
     Rollups and memories are not affected.
     """
     return await run(mem.tool_prune())
+
+
+@app.get("/fading")
+async def fading_memories(
+    entity_name: str | None = None,
+    threshold: float = 0.5,
+    limit: int = 20,
+):
+    """
+    Return memories whose confidence has fallen below `threshold`, most faded first.
+
+    Query params:
+      entity_name — scope to one entity (optional)
+      threshold   — confidence ceiling (default 0.5)
+      limit       — max rows to return (default 20)
+    """
+    return await run(mem.tool_get_fading_memories(
+        entity_name=entity_name,
+        threshold=threshold,
+        limit=limit,
+    ))
 
 
 # ── Convenience: bulk record (for batch sensor pushes) ────────────────────────

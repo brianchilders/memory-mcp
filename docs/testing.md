@@ -43,6 +43,7 @@ python -m pytest --tb=short
 | `tests/test_graph.py` | Graph endpoints — GET /graph HTML page, GET /api/graph nodes/edges structure, memory_count, inline memories, active-only edge filter (valid_until), auth exemption |
 | `tests/test_markdown_export.py` | Markdown export — single entity (frontmatter, heading, observations, wikilinks, 404), bulk export (JSON files dict), inactive relation exclusion, auth exemption |
 | `tests/test_markdown_import.py` | Markdown import — parse_markdown() unit tests (name, type, category, wikilinks, em/en-dash, placeholder skip), POST /import/markdown (create, existing, idempotency, roundtrip, requires auth) |
+| `tests/test_decay.py` | Confidence decay — _decay_memories() (exponential formula, floor, per-category halflife, disabled at 0, superseded rows skipped), recall confidence boost, tool_get_fading_memories() (threshold, scope, ordering, limit, superseded exclusion), GET /fading HTTP endpoint |
 
 ## Fixture design
 

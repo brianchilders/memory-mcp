@@ -342,12 +342,25 @@ async def import_files(files: dict[str, str]) -> dict:
             }
 
     # ── Pass 2: relations ─────────────────────────────────────────────────────
+    db = mem.get_db()
     for name, parsed in parsed_by_name.items():
         if results.get(name, {}).get("status") == "error":
             continue
         relations_added = 0
         for r in parsed["relations"]:
             try:
+                # Skip if an active relation already exists (tool_relate always succeeds,
+                # so we must guard here to report accurate relations_added counts).
+                a = db.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
+                b = db.execute("SELECT id FROM entities WHERE name=?", (r["other_name"],)).fetchone()
+                if a and b:
+                    already = db.execute(
+                        """SELECT id FROM relations
+                           WHERE entity_a=? AND entity_b=? AND rel_type=? AND valid_until IS NULL""",
+                        (a["id"], b["id"], r["rel_type"]),
+                    ).fetchone()
+                    if already:
+                        continue
                 await mem.tool_relate(
                     entity_a=name,
                     entity_b=r["other_name"],
@@ -355,9 +368,9 @@ async def import_files(files: dict[str, str]) -> dict:
                 )
                 relations_added += 1
             except Exception:
-                # Duplicate relation (already active) — silently skip
                 pass
         results[name]["relations_added"] = relations_added
+    db.close()
 
     return {"imported": results, "errors": errors}
 

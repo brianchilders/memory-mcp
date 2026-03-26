@@ -97,7 +97,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (408 tests, no Ollama needed)
+python -m pytest                     # full suite (418 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -193,9 +193,10 @@ TIER 3
 | `cross_query`  | Semantic search across memories AND live readings     |
 
 ### Maintenance
-| Tool    | Description                                                    |
-|---------|----------------------------------------------------------------|
-| `prune` | Delete raw readings older than `RETENTION_DAYS` (default 30d) |
+| Tool                   | Description                                                    |
+|------------------------|----------------------------------------------------------------|
+| `prune`                | Delete raw readings older than `RETENTION_DAYS` (default 30d) |
+| `get_fading_memories`  | Return memories whose confidence has fallen below a threshold, most faded first |
 
 ## HTTP API endpoints (api.py)
 
@@ -215,6 +216,7 @@ POST /get_trends                trend summary
 POST /schedule                  add schedule event
 POST /cross_query               unified search
 POST /prune                     delete readings older than RETENTION_DAYS
+GET  /fading                    memories below a confidence threshold (most faded first)
 
 POST /open_session              open a conversation session for an entity
 POST /log_turn                  append a turn (user/assistant/system) to a session
