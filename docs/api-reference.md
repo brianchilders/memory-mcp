@@ -10,7 +10,7 @@ All request and response bodies are JSON. All timestamps are Unix epoch seconds 
 
 ### `GET /health`
 
-Liveness check. Returns row counts for all tables.
+Liveness check. Returns row counts for all tables and the MCP protocol version.
 
 **Response:**
 ```json
@@ -19,9 +19,51 @@ Liveness check. Returns row counts for all tables.
   "entities": 3,
   "memories": 47,
   "readings": 12840,
-  "ts": 1711123456.78
+  "ts": 1711123456.78,
+  "mcp_protocol_version": "2025-11-25"
 }
 ```
+
+---
+
+### `GET /mcp-info`
+
+MCP spec compliance information. Returns the protocol version the server implements,
+the SDK version in use, and the full list of registered MCP tools.
+
+Useful for MCP clients that need to verify compatibility before connecting,
+and for monitoring when the SDK is updated to a new protocol version.
+
+**Response:**
+```json
+{
+  "mcp_sdk_version": "1.26.0",
+  "mcp_protocol_version": "2025-11-25",
+  "mcp_default_negotiated_version": "2025-03-26",
+  "tool_count": 20,
+  "tools": [
+    {"name": "remember",    "description": "Store a semantic fact/memory about any entity."},
+    {"name": "recall",      "description": "Semantic search across all stored memories."},
+    {"name": "get_context", "description": "..."},
+    "..."
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `mcp_sdk_version` | Installed `mcp` Python package version |
+| `mcp_protocol_version` | `LATEST_PROTOCOL_VERSION` from `mcp.types` — the spec version the SDK targets |
+| `mcp_default_negotiated_version` | `DEFAULT_NEGOTIATED_VERSION` — what is negotiated by default during handshake |
+| `tool_count` | Number of registered MCP tools |
+| `tools` | Array of `{name, description}` for every registered tool |
+
+**Protocol version format:** `YYYY-MM-DD` (MCP uses date-based versioning).
+
+**SDK upgrade notice:** `test_mcp_info_protocol_version_matches_sdk` in
+`tests/test_mcp_compliance.py` will fail immediately if the SDK is upgraded to
+a new spec version, prompting you to validate the server against the new spec
+before the upgrade lands in production.
 
 ---
 
@@ -896,6 +938,173 @@ result = requests.post(
     headers={"Authorization": "Bearer <token>"},
 ).json()
 ```
+
+---
+
+## Graph Traversal
+
+### `GET /related/{entity_name}`
+
+Find all entities reachable from `entity_name` within `depth` hops via active relations.
+Traversal is **bidirectional** — both outgoing and incoming edges are followed.
+Only relations with `valid_until IS NULL` are included.
+
+| Query param | Type | Default | Constraints | Description |
+|---|---|---|---|---|
+| `depth` | int | `2` | 1–5 | Maximum hops (clamped server-side) |
+| `max_results` | int | `50` | 1–500 | Maximum entities to return |
+
+**Response:**
+```json
+{"result": "Entities related to 'Alice' (depth=2):\n[1 hop] Bob (person)\n[2 hops] Acme Corp (company)", "ok": true}
+```
+
+Returns `"No entity named '...'"` (HTTP 200) if the entity doesn't exist.
+Returns `"Alice has no related entities"` (HTTP 200) if no active relations exist.
+
+---
+
+## Importers
+
+### `POST /import/jsonl`
+
+Import entities, observations, and relations from Anthropic's official
+[`@modelcontextprotocol/server-memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory)
+JSONL format — one JSON object per line.
+
+**Request:**
+```json
+{
+  "content": "<newline-delimited JSON>"
+}
+```
+
+**Line types:**
+
+```jsonl
+{"type": "entity", "name": "Alice", "entityType": "person", "observations": ["Likes coffee", "Works at CERN"]}
+{"type": "relation", "from": "Alice", "to": "Bob", "relationType": "friend"}
+```
+
+- `content` is a raw string (not a file path). Maximum 5 MB, 10,000 lines.
+- Two-pass: entities are created first, then relations.
+- Relations referencing unknown entities create stub entities automatically.
+- Observations are deduplicated — already-stored facts are skipped.
+- Relations are idempotent — reimporting an active relation is a no-op.
+- All stored memories are tagged `source = "import:jsonl"`.
+
+**Response:**
+```json
+{"ok": true, "added": 3, "skipped": 1, "errors": []}
+```
+
+| Field | Description |
+|---|---|
+| `added` | Number of observations written to the DB |
+| `skipped` | Observations that already existed (deduplicated) |
+| `errors` | Array of per-line error messages (malformed JSON, bad field types, etc.) |
+
+---
+
+### `POST /import/mem0`
+
+Import memories from a [mem0](https://mem0.ai) instance (cloud or self-hosted).
+Paginates through all pages with exponential backoff on HTTP 429.
+
+**Request:**
+```json
+{
+  "user_id":     "alice",
+  "api_key":     "m0-...",
+  "base_url":    "https://api.mem0.ai",
+  "entity_type": "person"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `user_id` | string | yes | — | mem0 user identifier; used as entity name |
+| `api_key` | string | no | `null` | API key (required for mem0 cloud; omit for unauthenticated self-hosted) |
+| `base_url` | string | no | `"https://api.mem0.ai"` | Must be `http://` or `https://` |
+| `agent_id` | string | no | `null` | Filter by agent_id |
+| `app_id` | string | no | `null` | Filter by app_id |
+| `entity_type` | string | no | `"person"` | Entity type for the imported user entity |
+
+**Response:**
+```json
+{"ok": true, "added": 42, "skipped": 3, "errors": []}
+```
+
+Errors are returned with HTTP 400 for bad parameters (invalid URL scheme, empty `user_id`)
+or HTTP 500 for unexpected server errors.  HTTP 409 is never returned — mem0 errors appear
+in the `errors` array.
+
+---
+
+### `POST /import/mcp-memory-service`
+
+Import from a [doobidoo/mcp-memory-service](https://github.com/doobidoo/mcp-memory-service)
+SQLite database by reading it directly (no running service required).
+
+**Stop `mcp-memory-service` before importing** to avoid a locked-database error.
+
+**Request:**
+```json
+{
+  "db_path":     "/home/user/.config/mcp-memory/memories.db",
+  "entity_name": "imported",
+  "entity_type": "person"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `db_path` | string | yes | — | Absolute path to the SQLite file on the server |
+| `entity_name` | string | no | `"imported"` | Entity in memory-mcp to receive all imported memories |
+| `entity_type` | string | no | `"person"` | Entity type |
+
+**Response:**
+```json
+{"ok": true, "added": 156, "skipped": 0, "errors": []}
+```
+
+| Status | Meaning |
+|---|---|
+| `400` | Bad request — file not found, not a SQLite database, invalid entity name |
+| `409` | Conflict — SQLite database is locked (stop mcp-memory-service first) |
+
+The importer auto-discovers the table name (`memories`, `memory`, `items`, or `data`) and
+content column (`content`, `memory`, `observation`, `text`, `fact`, or `value`) via
+`PRAGMA table_info()`.
+
+---
+
+## Admin UI Curation
+
+These endpoints are called by the Admin UI (HTMX). They return HTML fragments, not JSON.
+
+### `POST /admin/memory/{memory_id}/delete`
+
+Delete a single memory and its vector embedding.
+
+- Returns `""` (empty body) with HTTP 200 on success — HTMX swaps the `<li>` row out of the DOM.
+- Returns HTTP 404 if `memory_id` does not exist.
+
+### `POST /admin/entity/{name}/remember`
+
+Add an observation to an existing entity from the Admin UI.
+
+**Form fields** (`Content-Type: application/x-www-form-urlencoded`):
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `fact` | yes | — | The observation text (stripped, max 10,000 chars) |
+| `category` | no | `"general"` | Memory category; invalid values silently default to `"general"` |
+
+- Returns HTTP 400 if `fact` is blank after stripping.
+- Returns HTTP 404 if the entity `name` does not exist.
+- Returns an HTML `<li>` fragment on success — HTMX appends it to the memory list.
+- All stored memories are tagged `source = "admin_ui"`.
 
 ---
 

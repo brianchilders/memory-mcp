@@ -5,11 +5,15 @@ Mounted at /admin in api.py.  Server-rendered HTML with Bootstrap 5 (CDN)
 and HTMX for partial-page updates (entity detail, live refresh, prune action).
 
 Routes:
-  GET  /admin/                    Dashboard — counts + recent activity
-  GET  /admin/entities            Entity list
-  GET  /admin/entity/{name}       Entity detail (profile + readings)
-  GET  /admin/readings            Recent readings stream
-  POST /admin/prune               Prune old readings (returns HTML fragment for HTMX)
+  GET  /admin/                         Dashboard — counts + recent activity
+  GET  /admin/entities                 Entity list
+  GET  /admin/entity/{name}            Entity detail (profile + readings)
+  GET  /admin/readings                 Recent readings stream
+  POST /admin/prune                    Prune old readings (HTMX fragment)
+  POST /admin/memory/{id}/delete       Delete a single memory (HTMX fragment)
+  POST /admin/entity/{name}/remember   Add an observation (HTMX fragment)
+  GET  /admin/settings                 Token management
+  POST /admin/token/regenerate         Generate new token (HTMX fragment)
 """
 
 import html as html_mod
@@ -18,7 +22,7 @@ import time
 from pathlib import Path
 
 import server as mem
-from fastapi import APIRouter
+from fastapi import APIRouter, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
@@ -269,6 +273,104 @@ async def prune_action(request: Request):
         f'{mem.RETENTION_DAYS} days. '
         f'<strong>{remaining:,}</strong> readings remain.'
         f'</div>'
+    )
+
+
+# ── Memory curation ────────────────────────────────────────────────────────────
+
+@router.post("/memory/{memory_id}/delete", response_class=HTMLResponse)
+async def memory_delete(request: Request, memory_id: int):
+    """
+    Delete a single memory by integer id.  Returns an HTMX-swappable HTML
+    fragment — an empty string on success (the list item removes itself) or a
+    small error badge on failure.
+
+    Uses POST (not DELETE) so plain HTML forms work without JavaScript.
+    """
+    db = mem.get_db()
+    row = db.execute("SELECT id FROM memories WHERE id=?", (memory_id,)).fetchone()
+    if not row:
+        db.close()
+        return HTMLResponse(
+            f'<span class="badge bg-danger">Memory {memory_id} not found</span>',
+            status_code=404,
+        )
+    db.execute("DELETE FROM memory_vectors WHERE rowid=?", (memory_id,))
+    db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+    db.commit()
+    db.close()
+    # Return empty — HTMX hx-swap="outerHTML" on the list item removes the row
+    return HTMLResponse("", status_code=200)
+
+
+@router.post("/entity/{name}/remember", response_class=HTMLResponse)
+async def entity_remember(
+    request: Request,
+    name: str,
+    fact: str = Form(...),
+    category: str = Form("general"),
+):
+    """
+    Add an observation (memory) to an existing entity from the admin UI.
+    Returns an HTMX-swappable HTML fragment — a new <li> row on success or
+    an error alert on failure.
+
+    The entity must already exist.  Fact is limited to 10 000 characters.
+    Category is validated against the allowed enum.
+    """
+    _VALID_CATEGORIES = {
+        "preference", "habit", "routine", "relationship", "insight", "general"
+    }
+    fact = fact.strip()[:10_000]
+    category = category.strip().lower()
+    if not fact:
+        return HTMLResponse(
+            '<div class="alert alert-warning py-1 mb-0">Fact cannot be empty.</div>',
+            status_code=400,
+        )
+    if category not in _VALID_CATEGORIES:
+        category = "general"
+
+    # Validate entity exists
+    db = mem.get_db()
+    e = db.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
+    if not e:
+        db.close()
+        return HTMLResponse(
+            f'<div class="alert alert-danger py-1 mb-0">'
+            f'Entity {html_mod.escape(name)!r} not found.</div>',
+            status_code=404,
+        )
+    db.close()
+
+    # Delegate to tool_remember (handles embedding + contradiction detection)
+    try:
+        await mem.tool_remember(
+            entity_name=name,
+            fact=fact,
+            category=category,
+            source="admin_ui",
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f'<div class="alert alert-danger py-1 mb-0">'
+            f'Error: {html_mod.escape(str(exc))}</div>',
+            status_code=500,
+        )
+
+    escaped_fact     = html_mod.escape(fact)
+    escaped_category = html_mod.escape(category)
+    return HTMLResponse(
+        f'<li class="list-group-item py-2" id="new-memory-row">'
+        f'  <div class="d-flex justify-content-between align-items-start">'
+        f'    <pre class="fact flex-grow-1 me-2">{escaped_fact}</pre>'
+        f'    <div class="text-end text-muted small" style="min-width:110px">'
+        f'      <span class="badge bg-success mb-1">just added</span>'
+        f'    </div>'
+        f'  </div>'
+        f'  <small class="text-muted">category: {escaped_category} · source: admin_ui</small>'
+        f'</li>',
+        status_code=200,
     )
 
 

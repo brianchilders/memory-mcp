@@ -97,7 +97,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (418 tests, no Ollama needed)
+python -m pytest                     # full suite (527 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 

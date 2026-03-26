@@ -1888,6 +1888,83 @@ async def _consolidate_memories() -> int:
     return total_superseded
 
 
+async def tool_get_related(
+    entity_name: str,
+    depth: int = 2,
+    max_results: int = 50,
+) -> str:
+    """
+    Find all entities reachable from entity_name within `depth` hops via active
+    relations.  Traversal is bidirectional — both outgoing (entity_a) and incoming
+    (entity_b) edges are followed.  Only relations with valid_until IS NULL are
+    considered.
+
+    Depth is clamped to 1–5 to prevent runaway recursive queries.
+
+    Parameters
+    ----------
+    entity_name : str
+        Starting entity.
+    depth       : int (default 2)
+        Maximum number of hops from the starting entity (clamped 1–5).
+    max_results : int (default 50)
+        Maximum number of related entities to return.
+    """
+    db = get_db()
+    e = db.execute("SELECT id FROM entities WHERE name=?", (entity_name,)).fetchone()
+    if not e:
+        db.close()
+        return f"No entity named {entity_name!r}."
+
+    depth       = min(max(int(depth), 1), 5)     # clamp 1–5
+    max_results = min(max(int(max_results), 1), 500)  # clamp 1–500
+
+    rows = db.execute(
+        """WITH RECURSIVE related(eid, hops) AS (
+               SELECT id, 0
+               FROM entities
+               WHERE name = ?
+
+               UNION
+
+               SELECT
+                   CASE WHEN r.entity_a = g.eid
+                        THEN r.entity_b
+                        ELSE r.entity_a
+                   END,
+                   g.hops + 1
+               FROM related g
+               JOIN relations r
+                 ON (r.entity_a = g.eid OR r.entity_b = g.eid)
+                AND r.valid_until IS NULL
+               WHERE g.hops < ?
+           )
+           SELECT e.name, e.type, MIN(r2.hops) AS hops
+           FROM related r2
+           JOIN entities e ON e.id = r2.eid
+           WHERE r2.eid != (SELECT id FROM entities WHERE name = ?)
+           GROUP BY e.id
+           ORDER BY hops, e.name
+           LIMIT ?""",
+        (entity_name, depth, entity_name, max_results),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return (
+            f"No related entities found for {entity_name!r} "
+            f"within {depth} hop(s)."
+        )
+
+    lines = [
+        f"Entities related to {entity_name!r} within {depth} hop(s):\n"
+    ]
+    for r in rows:
+        hop_label = "1 hop" if r["hops"] == 1 else f"{r['hops']} hops"
+        lines.append(f"  [{hop_label}] {r['name']} ({r['type']})")
+    return "\n".join(lines)
+
+
 async def tool_get_fading_memories(
     entity_name: str | None = None,
     threshold: float = 0.5,
@@ -2106,6 +2183,17 @@ TOOLS = [
              "Rollups and memories are preserved. Returns count of deleted rows."
          ),
          inputSchema={"type":"object","properties":{}}),
+    Tool(name="get_related",
+         description=(
+             "Find all entities reachable from a starting entity within N hops "
+             "via active relations. Traversal is bidirectional. Depth is clamped "
+             "to 1–5 to prevent runaway queries."
+         ),
+         inputSchema={"type":"object","required":["entity_name"],"properties":{
+             "entity_name":{"type":"string"},
+             "depth":{"type":"integer","default":2,
+                 "description":"Maximum hops from the starting entity (1–5)"},
+             "max_results":{"type":"integer","default":50}}}),
     Tool(name="get_fading_memories",
          description=(
              "Return memories whose confidence has fallen below a threshold — "
@@ -2147,6 +2235,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "close_session": tool_close_session,
         "get_session":   tool_get_session,
         "prune":                tool_prune,
+        "get_related":          tool_get_related,
         "get_fading_memories":  tool_get_fading_memories,
     }
     fn = dispatch.get(name)

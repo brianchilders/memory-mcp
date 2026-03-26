@@ -28,6 +28,10 @@ Endpoints:
     POST /query_stream          POST /get_trends
     POST /schedule              POST /cross_query
     POST /prune                 GET  /fading
+    GET  /related/{name}
+
+    POST /import/jsonl          POST /import/mem0
+    POST /import/mcp-memory-service
 
     GET  /graph                 GET  /api/graph
     GET  /export/markdown       GET  /export/markdown/{name}
@@ -50,8 +54,9 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -70,6 +75,9 @@ from exporters.markdown import (
     export_all as export_all_markdown,
     import_files as import_markdown_files,
 )
+from importers.jsonl import import_jsonl
+from importers.mem0 import import_mem0
+from importers.mcp_memory_service import import_mcp_memory_service
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
@@ -194,6 +202,12 @@ app.add_middleware(AuthMiddleware)
 app.include_router(admin_router)
 app.include_router(voice_router)
 app.include_router(graph_router)
+
+# Serve vendored frontend assets (Bootstrap, HTMX, vis-network) from local disk.
+# No CDN dependencies — eliminates supply-chain risk from third-party script injection.
+# To update a library: edit tools/download_vendor.py and re-run it.
+_VENDOR_DIR = Path(__file__).parent / "static" / "vendor"
+app.mount("/static/vendor", StaticFiles(directory=str(_VENDOR_DIR)), name="vendor")
 
 
 # ── Request / response models ──────────────────────────────────────────────────
@@ -321,11 +335,21 @@ async def favicon():
     return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
 
 
+# ── MCP protocol version (resolved once at import time) ────────────────────────
+
+from importlib.metadata import version as _pkg_version
+import mcp.types as _mcp_types
+
+_MCP_SDK_VERSION        = _pkg_version("mcp")
+_MCP_PROTOCOL_VERSION   = _mcp_types.LATEST_PROTOCOL_VERSION
+_MCP_DEFAULT_NEGOTIATED = _mcp_types.DEFAULT_NEGOTIATED_VERSION
+
+
 # ── Health + introspection ─────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    """Quick liveness check — also returns entity count."""
+    """Quick liveness check — returns row counts and MCP protocol version."""
     db = mem.get_db()
     n_entities = db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     n_memories = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -337,6 +361,29 @@ async def health():
         "memories": n_memories,
         "readings": n_readings,
         "ts": time.time(),
+        "mcp_protocol_version": _MCP_PROTOCOL_VERSION,
+    }
+
+
+@app.get("/mcp-info")
+async def mcp_info():
+    """
+    MCP spec compliance information.
+
+    Returns the MCP protocol version this server implements, the SDK version
+    in use, and the registered tool list.  Useful for clients that need to
+    verify compatibility before connecting.
+    """
+    tools = [
+        {"name": t.name, "description": t.description or ""}
+        for t in mem.TOOLS
+    ]
+    return {
+        "mcp_sdk_version":               _MCP_SDK_VERSION,
+        "mcp_protocol_version":          _MCP_PROTOCOL_VERSION,
+        "mcp_default_negotiated_version": _MCP_DEFAULT_NEGOTIATED,
+        "tool_count":                    len(tools),
+        "tools":                         tools,
     }
 
 
@@ -502,6 +549,33 @@ async def fading_memories(
 class BulkRecordRequest(BaseModel):
     readings: list[RecordRequest]
 
+class ImportJSONLRequest(BaseModel):
+    content: str = Field(
+        description="Raw JSONL text (one JSON object per line). Max 5 MB.",
+        max_length=5 * 1024 * 1024,
+    )
+
+class ImportMem0Request(BaseModel):
+    user_id: str = Field(description="mem0 user identifier; becomes the entity name")
+    api_key: str | None = Field(default=None, description="mem0 API key")
+    base_url: str = Field(
+        default="https://api.mem0.ai",
+        description="mem0 API base URL (http/https only)",
+    )
+    agent_id: str | None = None
+    app_id: str | None = None
+    entity_type: str = "person"
+
+class ImportMCPMemoryServiceRequest(BaseModel):
+    db_path: str = Field(
+        description="Absolute path to the mcp-memory-service SQLite file"
+    )
+    entity_name: str = Field(
+        default="imported",
+        description="Entity name in memory-mcp to receive all imported memories",
+    )
+    entity_type: str = "person"
+
 class ImportMarkdownRequest(BaseModel):
     files: dict[str, str] = Field(
         description="Mapping of filename → markdown content, e.g. {'Brian.md': '---\\ntype: person\\n...'}"
@@ -521,6 +595,98 @@ async def record_bulk(req: BulkRecordRequest):
         except Exception as e:
             results.append({"ok": False, "error": str(e)})
     return {"results": results, "count": len(results)}
+
+
+# ── Graph traversal ────────────────────────────────────────────────────────────
+
+@app.get("/related/{entity_name}")
+async def related(entity_name: str, depth: int = 2, max_results: int = Query(50, ge=1, le=500)):
+    """
+    Find all entities reachable from entity_name within `depth` hops via active
+    relations.  Traversal is bidirectional.  Depth is clamped to 1–5.
+
+    Query params:
+      depth       — max hops from the starting entity (default 2, max 5)
+      max_results — max entities to return (default 50)
+    """
+    return await run(mem.tool_get_related(
+        entity_name=entity_name,
+        depth=depth,
+        max_results=max_results,
+    ))
+
+
+# ── JSONL import (Anthropic official MCP Memory format) ────────────────────────
+
+@app.post("/import/jsonl")
+async def import_jsonl_endpoint(req: ImportJSONLRequest):
+    """
+    Import from the Anthropic official @modelcontextprotocol/server-memory JSONL format.
+
+    Accepts the raw JSONL text (content string — never a file path).  Content is
+    capped at 5 MB; up to 10 000 lines are processed.
+
+    Format: one JSON object per line::
+
+        {"type": "entity",   "name": "John_Smith", "entityType": "person",
+         "observations": ["Speaks fluent Spanish"]}
+        {"type": "relation", "from": "John_Smith",  "to": "Acme_Corp",
+         "relationType": "works_at"}
+
+    Returns:
+        {"added": int, "skipped": int, "errors": [...], "ok": true}
+    """
+    try:
+        result = await import_jsonl(req.content)
+        return {**result.to_dict(), "ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── mem0 import ────────────────────────────────────────────────────────────────
+
+@app.post("/import/mem0")
+async def import_mem0_endpoint(req: ImportMem0Request):
+    """
+    Import memories from mem0 (cloud or self-hosted).
+
+    All memories for the given user_id are imported as general observations on
+    a single entity named after the user_id.  Pagination is handled automatically;
+    exponential backoff is applied on HTTP 429 responses.
+
+    base_url must be http:// or https:// — other schemes are rejected.
+    """
+    try:
+        result = await import_mem0(**req.model_dump())
+        return {**result.to_dict(), "ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── mcp-memory-service import ──────────────────────────────────────────────────
+
+@app.post("/import/mcp-memory-service")
+async def import_mcp_memory_service_endpoint(req: ImportMCPMemoryServiceRequest):
+    """
+    Import from a doobidoo/mcp-memory-service SQLite database.
+
+    Reads the database at db_path directly (no network call).  The file must
+    exist, be a regular file, and pass the SQLite magic-byte check.  Stop
+    mcp-memory-service before importing to avoid a locked-database error.
+    """
+    try:
+        result = await import_mcp_memory_service(**req.model_dump())
+        return {**result.to_dict(), "ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Markdown export ────────────────────────────────────────────────────────────
