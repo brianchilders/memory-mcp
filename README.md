@@ -93,6 +93,60 @@ export MEMORY_LLM_MODEL=gpt-4o-mini
 
 See `docs/ai-backend.md` for full configuration guide and provider examples.
 
+## Source trust tiers
+
+Every memory carries a trust tier that controls conflict resolution. When a new
+fact is written, it can only supersede an existing contradicting memory if its
+trust is **equal or higher**. Lower-trust sources cannot overwrite what you
+explicitly told the system.
+
+| Tier | Label | When to use |
+|---|---|---|
+| 5 | `user` | Direct user statements, manual entries via admin UI |
+| 4 | `hardware` | Verified sensors, signed device data |
+| 3 | `system` | Pattern engine promotions, LLM-extracted facts |
+| 2 | `inferred` | Working memory promotions, low-confidence extractions |
+| 1 | `external` | Third-party imports, unverified webhooks |
+
+**Example:** a sensor (tier 4) recording "bedroom temperature is 68°F" will not
+overwrite an explicit user statement (tier 5) "I keep my bedroom at 66°F at night."
+
+Set via the `source_trust` parameter on `remember` / `POST /remember`.
+Defaults to `MEMORY_TRUST_DEFAULT_REMEMBER` (env var, default: 5=user).
+
+## Confidence decay
+
+Memory confidence decays automatically over time so stale facts fade gracefully
+instead of accumulating indefinitely. Decay runs every hour in the pattern engine.
+
+**Formula:** `confidence = confidence × 2^(−days / halflife)`
+
+| Category | Default half-life | Meaning |
+|---|---|---|
+| `preference`, `habit`, `routine` | 90 days | Stable — takes months to fade |
+| `insight`, `general` | 90 days | Same default |
+| `relationship` | 90 days | Same default |
+| Location records | 24 hours | Unconfirmed location drops to 50% overnight |
+
+Configure per-category overrides:
+```bash
+export MEMORY_DECAY_HALFLIFE_DAYS=90          # global default
+export MEMORY_DECAY_CATEGORY_HALFLIFE='{"preference": 180, "insight": 30}'
+export MEMORY_LOCATION_DECAY_HALFLIFE_HOURS=24
+```
+
+Use `GET /fading` (or `get_fading_memories`) to surface memories whose
+confidence has dropped below a threshold — a prompt to confirm or update them.
+
+## AI call timeout
+
+```bash
+export MEMORY_AI_TIMEOUT=30    # seconds; applies to both embed() and LLM calls
+```
+
+Increase if using a slow local model. LLM calls use `max(MEMORY_AI_TIMEOUT, 60)`
+to guarantee at least 60 seconds for generation.
+
 ## Testing
 
 ```bash

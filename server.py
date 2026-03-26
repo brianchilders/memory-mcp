@@ -108,8 +108,22 @@ DECAY_RECALL_BOOST     = 0.05   # confidence nudge applied when a memory is reca
 
 # ── Spatial / location memory ───────────────────────────────────────────────────
 LOCATION_DECAY_HALFLIFE_HOURS = float(os.getenv("MEMORY_LOCATION_DECAY_HALFLIFE_HOURS", "24"))
+
+# ── AI call timeout ─────────────────────────────────────────────────────────────
+# Applies to both embed() and _call_llm(). Increase if using a slow local model.
+_AI_TIMEOUT = float(os.getenv("MEMORY_AI_TIMEOUT", "30"))
 LOCATION_DECAY_FLOOR          = 0.05   # minimum confidence for any active location record
 LOCATION_CONFIDENCE_BOOST     = 0.10   # confidence nudge applied when seen_at confirms a location
+
+# ── Input validation limits ────────────────────────────────────────────────────
+_MAX_ENTITY_NAME = 500
+_MAX_FACT_LEN    = 10_000
+_MAX_REL_TYPE    = 200
+_MAX_SHORT_STR   = 200     # unit, note, metric, source, container_name
+
+_VALID_CATEGORIES: frozenset[str] = frozenset({
+    "preference", "habit", "routine", "relationship", "insight", "general"
+})
 
 # ── Source trust tiers ─────────────────────────────────────────────────────────
 #
@@ -693,7 +707,7 @@ async def embed(text: str) -> list[float]:
     implements the OpenAI embeddings spec.  Configure via MEMORY_AI_BASE_URL,
     MEMORY_AI_API_KEY, MEMORY_EMBED_MODEL, and MEMORY_EMBED_DIM env vars.
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=_AI_TIMEOUT) as client:
         r = await client.post(
             f"{AI_BASE_URL}/embeddings",
             headers=_ai_headers(),
@@ -730,7 +744,7 @@ async def _call_llm(prompt: str, model: str) -> str:
     implements the OpenAI chat completions spec.  Mockable in tests via
     monkeypatch.setattr(server, '_call_llm', mock_fn).
     """
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=max(_AI_TIMEOUT, 60)) as client:
         r = await client.post(
             f"{AI_BASE_URL}/chat/completions",
             headers=_ai_headers(),
@@ -877,6 +891,14 @@ async def tool_remember(
     Defaults to TRUST_DEFAULT_REMEMBER (env: MEMORY_TRUST_DEFAULT_REMEMBER, default 5).
     Lower-trust facts will NOT supersede higher-trust contradicting memories.
     """
+    # ── Input normalisation ────────────────────────────────────────────────────
+    entity_name = entity_name.strip()[:_MAX_ENTITY_NAME]
+    fact        = fact.strip()[:_MAX_FACT_LEN]
+    category    = category if category in _VALID_CATEGORIES else "general"
+    confidence  = max(0.0, min(1.0, float(confidence)))
+    if source:
+        source = source.strip()[:_MAX_SHORT_STR]
+
     trust = max(TRUST_EXTERNAL, min(TRUST_USER, int(source_trust))) \
         if source_trust is not None else TRUST_DEFAULT_REMEMBER
 
@@ -1172,6 +1194,11 @@ async def tool_get_profile(entity_name: str) -> str:
 async def tool_relate(
     entity_a: str, entity_b: str, rel_type: str, meta: dict | None = None
 ) -> str:
+    entity_a = entity_a.strip()[:_MAX_ENTITY_NAME]
+    entity_b = entity_b.strip()[:_MAX_ENTITY_NAME]
+    rel_type = rel_type.strip()[:_MAX_REL_TYPE]
+    if not rel_type:
+        return "rel_type must not be empty."
     db = get_db()
     a = upsert_entity(db, entity_a)
     b = upsert_entity(db, entity_b)
@@ -1258,6 +1285,12 @@ async def tool_record(
     Ingest a single time-series reading.
     value: float/int → numeric | str → categorical | dict → composite
     """
+    entity_name = entity_name.strip()[:_MAX_ENTITY_NAME]
+    metric      = metric.strip()[:_MAX_SHORT_STR]
+    if unit:
+        unit = unit.strip()[:_MAX_SHORT_STR]
+    if source:
+        source = source.strip()[:_MAX_SHORT_STR]
     db = get_db()
     eid = upsert_entity(db, entity_name, entity_type)
     now = ts or time.time()
@@ -3258,8 +3291,8 @@ async def pattern_engine_loop():
             db.execute("PRAGMA wal_checkpoint(PASSIVE)")
             db.close()
             log.info("Pattern engine: done.")
-        except Exception as e:
-            log.error(f"Pattern engine error: {e}")
+        except Exception:
+            log.exception("Pattern engine error")
         await asyncio.sleep(PATTERN_INTERVAL)
 
 
@@ -3284,6 +3317,13 @@ async def tool_locate(
         new active row, so history is preserved.
       • No existing location → inserts the first active row.
     """
+    entity_name    = entity_name.strip()[:_MAX_ENTITY_NAME]
+    container_name = container_name.strip()[:_MAX_ENTITY_NAME]
+    confidence     = max(0.0, min(1.0, float(confidence)))
+    if source:
+        source = source.strip()[:_MAX_SHORT_STR]
+    if note:
+        note = note.strip()[:_MAX_SHORT_STR]
     db  = get_db()
     now = time.time()
     eid = upsert_entity(db, entity_name, entity_type)

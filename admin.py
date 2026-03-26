@@ -295,10 +295,15 @@ async def memory_delete(request: Request, memory_id: int):
             f'<span class="badge bg-danger">Memory {memory_id} not found</span>',
             status_code=404,
         )
-    db.execute("DELETE FROM memory_vectors WHERE rowid=?", (memory_id,))
-    db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-    db.commit()
-    db.close()
+    try:
+        db.execute("DELETE FROM memory_vectors WHERE rowid=?", (memory_id,))
+        db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
     # Return empty — HTMX hx-swap="outerHTML" on the list item removes the row
     return HTMLResponse("", status_code=200)
 
