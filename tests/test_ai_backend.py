@@ -143,7 +143,7 @@ async def test_call_llm_returns_assistant_content(httpx_mock):
 
 
 async def test_call_llm_sends_bearer_token_when_api_key_set(httpx_mock, monkeypatch):
-    monkeypatch.setattr(mem, "AI_API_KEY", "sk-llmkey")
+    monkeypatch.setattr(mem, "LLM_API_KEY", "sk-llmkey")
     httpx_mock.add_response(json=_llm_response())
     await mem._call_llm("test", mem.LLM_MODEL)
     req = httpx_mock.get_request()
@@ -151,7 +151,7 @@ async def test_call_llm_sends_bearer_token_when_api_key_set(httpx_mock, monkeypa
 
 
 async def test_call_llm_omits_auth_when_no_api_key(httpx_mock, monkeypatch):
-    monkeypatch.setattr(mem, "AI_API_KEY", "")
+    monkeypatch.setattr(mem, "LLM_API_KEY", "")
     httpx_mock.add_response(json=_llm_response())
     await mem._call_llm("test", mem.LLM_MODEL)
     req = httpx_mock.get_request()
@@ -159,7 +159,7 @@ async def test_call_llm_omits_auth_when_no_api_key(httpx_mock, monkeypatch):
 
 
 async def test_call_llm_uses_configured_base_url(httpx_mock, monkeypatch):
-    monkeypatch.setattr(mem, "AI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setattr(mem, "LLM_BASE_URL", "https://api.openai.com/v1")
     httpx_mock.add_response(json=_llm_response())
     await mem._call_llm("test", mem.LLM_MODEL)
     req = httpx_mock.get_request()

@@ -84,32 +84,55 @@ from importers.mcp_memory_service import import_mcp_memory_service
 
 async def _probe_ollama() -> None:
     """
-    Probe the configured AI base URL at startup and log the result.
+    Probe the embed and LLM backends at startup and log the result for each.
 
     Uses the OpenAI-compatible /models endpoint — works with Ollama, LM Studio,
-    and vLLM. Runs in a thread so it doesn't block the async event loop.
-    Failure is a warning, not an error — the server starts regardless.
+    and vLLM. When MEMORY_LLM_BASE_URL is the same as MEMORY_AI_BASE_URL (the
+    default), only one probe is made. Runs in a thread pool so it doesn't block
+    the async event loop. Failure is a warning, not an error.
     """
-    base = mem.os.environ.get("MEMORY_AI_BASE_URL", "http://localhost:11434/v1")
-    probe_url = base.rstrip("/") + "/models"
+    embed_base = mem.AI_BASE_URL
+    llm_base   = mem.LLM_BASE_URL
 
-    def _check() -> tuple[bool, str]:
+    def _check(url: str) -> tuple[bool, str]:
+        probe = url.rstrip("/") + "/models"
         try:
-            urllib.request.urlopen(probe_url, timeout=3)
+            urllib.request.urlopen(probe, timeout=3)
             return True, ""
         except urllib.error.URLError as exc:
             return False, str(exc.reason)
         except Exception as exc:
             return False, str(exc)
 
-    ok, reason = await asyncio.to_thread(_check)
-    if ok:
-        mem.log.info("AI backend reachable at %s", base)
+    if embed_base == llm_base:
+        # Single backend — one probe covers both
+        ok, reason = await asyncio.to_thread(_check, embed_base)
+        if ok:
+            mem.log.info("AI backend reachable at %s (embed + LLM)", embed_base)
+        else:
+            mem.log.warning(
+                "AI backend NOT reachable at %s — embedding and LLM calls will fail (%s)",
+                embed_base, reason,
+            )
     else:
-        mem.log.warning(
-            "AI backend NOT reachable at %s — embedding and LLM calls will fail until it is (%s)",
-            base, reason,
-        )
+        # Split backends — probe each independently
+        embed_ok, embed_reason = await asyncio.to_thread(_check, embed_base)
+        llm_ok,   llm_reason   = await asyncio.to_thread(_check, llm_base)
+
+        if embed_ok:
+            mem.log.info("Embed backend reachable at %s", embed_base)
+        else:
+            mem.log.warning(
+                "Embed backend NOT reachable at %s — embedding calls will fail (%s)",
+                embed_base, embed_reason,
+            )
+        if llm_ok:
+            mem.log.info("LLM backend reachable at %s", llm_base)
+        else:
+            mem.log.warning(
+                "LLM backend NOT reachable at %s — LLM calls will fail (%s)",
+                llm_base, llm_reason,
+            )
 
 
 @asynccontextmanager

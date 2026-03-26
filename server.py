@@ -51,32 +51,32 @@ DB_PATH = Path(os.environ.get("MEMORY_DB_PATH", str(Path(__file__).parent / "mem
 
 # ── AI backend — OpenAI-compatible (works with Ollama, OpenAI, LM Studio, etc.) ──
 #
-# Ollama (default — local, no key needed):
+# Single backend (default — both embed and LLM on the same server):
 #   MEMORY_AI_BASE_URL = http://localhost:11434/v1
 #   MEMORY_AI_API_KEY  = (empty)
 #   MEMORY_EMBED_MODEL = nomic-embed-text
 #   MEMORY_EMBED_DIM   = 768
 #   MEMORY_LLM_MODEL   = llama3.2
 #
-# OpenAI:
-#   MEMORY_AI_BASE_URL = https://api.openai.com/v1
-#   MEMORY_AI_API_KEY  = sk-...
-#   MEMORY_EMBED_MODEL = text-embedding-3-small
-#   MEMORY_EMBED_DIM   = 1536
-#   MEMORY_LLM_MODEL   = gpt-4o-mini
+# Split backend (embed on one host, LLM on another):
+#   MEMORY_AI_BASE_URL   = http://localhost:11434/v1      # embed fallback
+#   MEMORY_EMBED_MODEL   = nomic-embed-text
+#   MEMORY_EMBED_DIM     = 768
+#   MEMORY_LLM_BASE_URL  = http://gpu-host:11434/v1       # LLM-specific override
+#   MEMORY_LLM_MODEL     = llama3.2
 #
-# LM Studio (local):
-#   MEMORY_AI_BASE_URL = http://localhost:1234/v1
-#   MEMORY_AI_API_KEY  = lm-studio
-#   MEMORY_EMBED_MODEL = <loaded-embed-model>
-#   MEMORY_EMBED_DIM   = <model-dim>
-#   MEMORY_LLM_MODEL   = <loaded-chat-model>
+# MEMORY_LLM_BASE_URL and MEMORY_LLM_API_KEY fall back to the shared
+# MEMORY_AI_BASE_URL / MEMORY_AI_API_KEY values when not set.
 #
 AI_BASE_URL = os.environ.get("MEMORY_AI_BASE_URL", "http://localhost:11434/v1")
 AI_API_KEY  = os.environ.get("MEMORY_AI_API_KEY",  "")
 EMBED_MODEL = os.environ.get("MEMORY_EMBED_MODEL", "nomic-embed-text")
-EMBED_DIM   = int(os.environ.get("MEMORY_EMBED_DIM",   "768"))
+EMBED_DIM   = int(os.environ.get("MEMORY_EMBED_DIM", "768"))
 LLM_MODEL   = os.environ.get("MEMORY_LLM_MODEL",   "llama3.2")
+
+# LLM-specific overrides — fall back to the shared values when not set
+LLM_BASE_URL = os.environ.get("MEMORY_LLM_BASE_URL", AI_BASE_URL)
+LLM_API_KEY  = os.environ.get("MEMORY_LLM_API_KEY",  AI_API_KEY)
 
 TOP_K_DEFAULT           = 5
 PATTERN_INTERVAL        = 3600   # seconds between pattern engine runs
@@ -698,23 +698,27 @@ def set_api_token(token: str) -> None:
 
 # ── Embedding helpers ──────────────────────────────────────────────────────────
 
-def _ai_headers() -> dict:
-    """Build Authorization header when an API key is configured."""
+def _embed_headers() -> dict:
+    """Authorization header for the embedding backend."""
     return {"Authorization": f"Bearer {AI_API_KEY}"} if AI_API_KEY else {}
+
+
+def _llm_headers() -> dict:
+    """Authorization header for the LLM backend (may differ from embed)."""
+    return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
 
 async def embed(text: str) -> list[float]:
     """
-    Embed text using the configured AI backend (OpenAI-compatible /v1/embeddings).
+    Embed text using the configured embedding backend (OpenAI-compatible /v1/embeddings).
 
-    Works with Ollama, OpenAI, LM Studio, Together AI, and any provider that
-    implements the OpenAI embeddings spec.  Configure via MEMORY_AI_BASE_URL,
-    MEMORY_AI_API_KEY, MEMORY_EMBED_MODEL, and MEMORY_EMBED_DIM env vars.
+    Controlled by MEMORY_AI_BASE_URL / MEMORY_AI_API_KEY / MEMORY_EMBED_MODEL.
+    The embedding backend can differ from the LLM backend — see MEMORY_LLM_BASE_URL.
     """
     async with httpx.AsyncClient(timeout=_AI_TIMEOUT) as client:
         r = await client.post(
             f"{AI_BASE_URL}/embeddings",
-            headers=_ai_headers(),
+            headers=_embed_headers(),
             json={"model": EMBED_MODEL, "input": text},
         )
         r.raise_for_status()
@@ -741,17 +745,17 @@ Text:
 
 async def _call_llm(prompt: str, model: str) -> str:
     """
-    Call the configured AI backend for text generation (OpenAI-compatible
+    Call the configured LLM backend for text generation (OpenAI-compatible
     /v1/chat/completions).
 
-    Works with Ollama, OpenAI, LM Studio, Together AI, and any provider that
-    implements the OpenAI chat completions spec.  Mockable in tests via
-    monkeypatch.setattr(server, '_call_llm', mock_fn).
+    Controlled by MEMORY_LLM_BASE_URL / MEMORY_LLM_API_KEY / MEMORY_LLM_MODEL,
+    falling back to MEMORY_AI_BASE_URL / MEMORY_AI_API_KEY when not set.
+    Mockable in tests via monkeypatch.setattr(server, '_call_llm', mock_fn).
     """
     async with httpx.AsyncClient(timeout=max(_AI_TIMEOUT, 60)) as client:
         r = await client.post(
-            f"{AI_BASE_URL}/chat/completions",
-            headers=_ai_headers(),
+            f"{LLM_BASE_URL}/chat/completions",
+            headers=_llm_headers(),
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
