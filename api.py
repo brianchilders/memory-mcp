@@ -383,6 +383,25 @@ class DismissIntentionRequest(BaseModel):
     intention_id: int
 
 
+class LocateRequest(BaseModel):
+    entity_name: str
+    container_name: str
+    entity_type: str = "object"
+    container_type: str = "room"
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source: str = "manual"
+    note: str | None = None
+
+
+class FindRequest(BaseModel):
+    entity_name: str
+
+
+class SeenAtRequest(BaseModel):
+    entity_name: str
+    container_name: str
+
+
 # ── Helper: wrap any coroutine and surface errors as HTTP 500 ──────────────────
 
 async def run(coro):
@@ -625,6 +644,32 @@ async def dismiss_intention(req: DismissIntentionRequest):
 async def list_intentions(entity_name: str | None = None, active_only: bool = True):
     """List intentions, optionally filtered by entity."""
     return await run(mem.tool_list_intentions(entity_name=entity_name, active_only=active_only))
+
+
+# ── Tier 5 — Spatial / location memory endpoints ───────────────────────────────
+
+@app.post("/locate")
+async def locate(req: LocateRequest):
+    """Store or update the last-known location of an object."""
+    return await run(mem.tool_locate(**req.model_dump()))
+
+
+@app.post("/find")
+async def find(req: FindRequest):
+    """Return the last known location of an object with confidence and age."""
+    return await run(mem.tool_find(**req.model_dump()))
+
+
+@app.post("/seen_at")
+async def seen_at(req: SeenAtRequest):
+    """Confirm an object is still at a location; bumps confidence."""
+    return await run(mem.tool_seen_at(**req.model_dump()))
+
+
+@app.get("/location_history/{entity_name}")
+async def location_history(entity_name: str, limit: int = Query(default=10, ge=1, le=100)):
+    """Return the full location history of an object."""
+    return await run(mem.tool_location_history(entity_name=entity_name, limit=limit))
 
 
 # ── Tier 2 — Time-series endpoints ────────────────────────────────────────────

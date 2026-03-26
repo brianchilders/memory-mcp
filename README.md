@@ -97,8 +97,9 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (682 tests, no Ollama needed)
+python -m pytest                     # full suite (722 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
+python -m pytest tests/test_spatial.py # just spatial/location tests
 ```
 
 See `docs/testing.md` for fixture design and conventions.
@@ -146,6 +147,11 @@ TIER 2
 
 TIER 3
   promoted_patterns id, entity_id, metric, pattern_key, memory_id, detected
+
+TIER 5
+  locations         id, entity_id, container_id, container_name, confidence,
+                    last_confirmed_ts, active, source, note, created
+                    (active=1 → current location; active=0 → archived sighting)
 ```
 
 ### Entity types (open — add any string)
@@ -219,6 +225,14 @@ TIER 3
 | `dismiss_intention`  | Deactivate an intention                                        |
 | `list_intentions`    | List active (or all) intentions for an entity                  |
 
+### Spatial / location memory (Tier 5)
+| Tool               | Description                                                       |
+|--------------------|-------------------------------------------------------------------|
+| `locate`           | Store or update where an object was last seen                     |
+| `find`             | Return last known location with confidence + age ("where are my keys?") |
+| `seen_at`          | Confirm object is still at its location; bumps confidence         |
+| `location_history` | Full trail of past sightings in reverse-chronological order       |
+
 ### Cross-tier
 | Tool           | Description                                           |
 |----------------|-------------------------------------------------------|
@@ -262,6 +276,11 @@ POST /wm/get                    get one slot or all slots from a task
 GET  /wm/list                   list tasks (?status=open|closed|expired|all&entity_name=X)
 GET  /wm/{task_id}              get all slots and metadata for a task
 POST /wm/close                  close a task (promote=true bundles slots into long-term memory)
+
+POST /locate                    store/update last-known location of an object
+POST /find                      return last known location with confidence + age
+POST /seen_at                   confirm object is still at a location; bumps confidence
+GET  /location_history/{name}   full location trail for an object
 
 POST /search_sessions           keyword search across session turn content (FTS5/BM25)
 POST /get_context_budget        token-budget context snapshot (greedy fill, truncated flag)

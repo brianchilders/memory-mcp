@@ -40,7 +40,7 @@ and for monitoring when the SDK is updated to a new protocol version.
   "mcp_sdk_version": "1.26.0",
   "mcp_protocol_version": "2025-11-25",
   "mcp_default_negotiated_version": "2025-03-26",
-  "tool_count": 31,
+  "tool_count": 35,
   "tools": [
     {"name": "remember",    "description": "Store a semantic fact/memory about any entity."},
     {"name": "recall",      "description": "Semantic search across all stored memories."},
@@ -885,6 +885,128 @@ List intentions, optionally filtered by entity and active status.
   "ok": true
 }
 ```
+
+---
+
+## Spatial / Location Memory
+
+Tracks the last-known location of physical objects with time-decaying confidence.
+Designed for "where did I put X?" queries in a home AI context.
+
+Each object has one **active** location (the current best guess) plus an
+archived history of past sightings. Confidence decays with a 24-hour half-life
+by default, so stale locations become increasingly uncertain without being lost.
+
+### `POST /locate`
+
+Store or update where an object was last seen. Creates the object entity and
+container entity if they don't exist. If the object was already recorded at this
+container, refreshes the timestamp. If it has moved, the old location is
+archived and a new active row is inserted.
+
+**Request:**
+```json
+{
+  "entity_name":    "keys",
+  "container_name": "entryway table",
+  "entity_type":    "object",
+  "container_type": "room",
+  "confidence":     1.0,
+  "source":         "manual",
+  "note":           "on the hook by the door"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entity_name` | string | yes | — | The object being located (e.g. `"keys"`, `"TV remote"`, `"passport"`) |
+| `container_name` | string | yes | — | Where it was seen (e.g. `"entryway table"`, `"kitchen counter"`) |
+| `entity_type` | string | no | `"object"` | Entity type for the object |
+| `container_type` | string | no | `"room"` | Entity type for the container |
+| `confidence` | float | no | `1.0` | Initial confidence 0.0–1.0 |
+| `source` | string | no | `"manual"` | Who reported this sighting |
+| `note` | string | no | `null` | Optional spatial detail (e.g. `"on top shelf"`) |
+
+**Responses:**
+- New location: `{"result": "Located: 'keys' is at 'entryway table'.", "ok": true}`
+- Same container refresh: `{"result": "Confirmed: 'keys' is still at 'entryway table'.", "ok": true}`
+
+---
+
+### `POST /find`
+
+Return the last known location of an object, with confidence level and time
+since last confirmed. Also shows the previous location when available.
+
+**Request:**
+```json
+{"entity_name": "keys"}
+```
+
+**Response (found):**
+```json
+{
+  "result": "'keys' was last seen at 'entryway table' — 3 hours ago (confidence: 85%).\nPreviously at 'kitchen counter' (2 days ago).",
+  "ok": true
+}
+```
+
+**Response (not found):**
+```json
+{"result": "No location recorded for 'invisible object'.", "ok": true}
+```
+
+---
+
+### `POST /seen_at`
+
+Confirm that an object is still at the given location. Bumps confidence by
+`LOCATION_CONFIDENCE_BOOST` (default 0.10, capped at 1.0) and refreshes
+`last_confirmed_ts`. If the object's active location is a different container,
+behaves like `POST /locate` (records a new sighting).
+
+**Request:**
+```json
+{"entity_name": "keys", "container_name": "entryway table"}
+```
+
+**Response:**
+```json
+{"result": "Confirmed: 'keys' still at 'entryway table' (confidence now 90%).", "ok": true}
+```
+
+---
+
+### `GET /location_history/{entity_name}`
+
+Return the full location history of an object — current and all past sightings
+in reverse-chronological order (most recent first).
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | `10` | Max sightings to return (1–100) |
+
+**Response:**
+```json
+{
+  "result": "Location history for 'keys' (3 sighting(s)):\n  [current] 'entryway table' — 3 hours ago (conf=85%)\n  [previous] 'kitchen counter' — 2 days ago (conf=100%)\n  [previous] 'entryway table' — 5 days ago (conf=100%)",
+  "ok": true
+}
+```
+
+**Confidence decay reference:**
+
+| Time since last confirmed | Approximate confidence (from 100%) |
+|---|---|
+| 12 hours | ~71% |
+| 24 hours | 50% |
+| 48 hours | 25% |
+| 1 week | ~7% → floored at 5% |
+
+Configure the half-life with `MEMORY_LOCATION_DECAY_HALFLIFE_HOURS` (default: `24`).
+Set to `0` to disable decay entirely.
 
 ---
 

@@ -195,11 +195,41 @@ composite sensor data with full rollup history.
 - **Retention:** Raw readings pruned after `RETENTION_DAYS` (default: 30 days).
   Rollups are never pruned — aggregates survive indefinitely.
 
-### What's not covered
+### 7. Spatial memory (object location tracking)
 
-**Spatial memory** (navigate a physical layout, remember object locations) is
-out of scope — memory-mcp is a knowledge and pattern store, not a navigation or
-robotics layer.
+Where did you put something? Spatial memory answers the "where did I leave X?"
+question by tracking the last-known location of objects with time-decaying
+confidence.
+
+- **Storage:** Tier 5 — `locations` table (one active row per object, historical rows archived)
+- **Write:** `locate` — store or update where an object was last seen; creates object and container entities automatically
+- **Confirm:** `seen_at` — confirm object is still at its current location; bumps confidence and refreshes timestamp
+- **Read:** `find` — return last known location with confidence and time since last seen; includes previous location so the user knows where else to look
+- **History:** `location_history` — full trail of past sightings in reverse-chronological order
+- **Decay:** Location confidence decays with a 24-hour half-life by default (`MEMORY_LOCATION_DECAY_HALFLIFE_HOURS`). An unconfirmed location drops to 50% after 24 h, 25% after 48 h, and floors at 5% — so it stays visible but clearly uncertain.
+
+**What this covers:** movable household objects (keys, remotes, books, passports, glasses). Objects that get moved are automatically archived as "previous", keeping the full trail intact.
+
+**What this does not cover:** precise XY coordinates, floor-plan navigation, or robotics wayfinding. Locations are room-entity references, not coordinates.
+
+**Example workflow:**
+```python
+# User leaves keys somewhere
+await mem.tool_locate("keys", "entryway table")
+
+# Next morning, user asks
+result = await mem.tool_find("keys")
+# → "'keys' was last seen at 'entryway table' — 9 hours ago (confidence: 75%)."
+
+# User walks past the entryway and confirms they're still there
+await mem.tool_seen_at("keys", "entryway table")
+# → "Confirmed: 'keys' still at 'entryway table' (confidence now 85%)."
+
+# Keys have moved — update the location
+await mem.tool_locate("keys", "kitchen counter", note="next to the coffee maker")
+# → "Located: 'keys' is at 'kitchen counter'."
+# Old location archived automatically.
+```
 
 ---
 
@@ -398,7 +428,7 @@ When you first clone and run memory-mcp, you get:
   admin settings page
 - **Docker Compose** for single-command production deployment:
   `docker compose up -d`
-- Full test suite (682 tests, no Ollama or internet connection required to run)
+- Full test suite (722 tests, no Ollama or internet connection required to run)
 - Comprehensive documentation covering every aspect of installation, operation,
   and extension
 

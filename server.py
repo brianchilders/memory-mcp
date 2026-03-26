@@ -106,6 +106,11 @@ if _raw:
 DECAY_CONFIDENCE_FLOOR = 0.05
 DECAY_RECALL_BOOST     = 0.05   # confidence nudge applied when a memory is recalled
 
+# ── Spatial / location memory ───────────────────────────────────────────────────
+LOCATION_DECAY_HALFLIFE_HOURS = float(os.getenv("MEMORY_LOCATION_DECAY_HALFLIFE_HOURS", "24"))
+LOCATION_DECAY_FLOOR          = 0.05   # minimum confidence for any active location record
+LOCATION_CONFIDENCE_BOOST     = 0.10   # confidence nudge applied when seen_at confirms a location
+
 # ── Source trust tiers ─────────────────────────────────────────────────────────
 #
 # Every stored memory carries a source_trust integer (1–5) indicating how much
@@ -440,6 +445,26 @@ def init_db():
     );
 
     CREATE INDEX IF NOT EXISTS idx_intentions_entity ON intentions(entity_id, active);
+
+    -- Tier 5 — Spatial memory (object location tracking)
+    -- active=1  → current known location; active=0 → archived sighting.
+    -- confidence decays hourly (halflife = MEMORY_LOCATION_DECAY_HALFLIFE_HOURS, default 24 h).
+    -- container_name is denormalized for display if the container entity is later deleted.
+    CREATE TABLE IF NOT EXISTS locations (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id         INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        container_id      INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+        container_name    TEXT    NOT NULL,
+        confidence        REAL    NOT NULL DEFAULT 1.0,
+        last_confirmed_ts REAL    NOT NULL,
+        active            INTEGER NOT NULL DEFAULT 1,
+        source            TEXT    DEFAULT 'manual',
+        note              TEXT,
+        created           REAL    NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_locations_entity    ON locations(entity_id, active);
+    CREATE INDEX IF NOT EXISTS idx_locations_container ON locations(container_id);
 
     CREATE INDEX IF NOT EXISTS idx_readings_entity_metric ON readings(entity_id, metric);
     CREATE INDEX IF NOT EXISTS idx_readings_ts            ON readings(ts);
@@ -2534,6 +2559,58 @@ async def _decay_memories() -> int:
     return updated
 
 
+def _format_age(seconds: float) -> str:
+    """Human-readable elapsed time: '45 seconds', '12 minutes', '3 hours', '2 days'."""
+    if seconds < 120:
+        return f"{int(seconds)} seconds"
+    if seconds < 7200:
+        return f"{int(seconds / 60)} minutes"
+    if seconds < 172800:
+        return f"{int(seconds / 3600)} hours"
+    return f"{int(seconds / 86400)} days"
+
+
+async def _decay_locations() -> int:
+    """
+    Apply exponential confidence decay to all active location records.
+
+    Half-life is LOCATION_DECAY_HALFLIFE_HOURS (default 24 h).
+    Examples: 24 h unconfirmed → 50%; 48 h → 25%; 1 week → floored at 5%.
+    Confidence is clamped to LOCATION_DECAY_FLOOR (0.05) so records stay
+    visible (still at that address, just uncertain) rather than vanishing.
+    Decay is skipped entirely when LOCATION_DECAY_HALFLIFE_HOURS == 0.
+
+    Returns the number of location records whose confidence changed.
+    """
+    if LOCATION_DECAY_HALFLIFE_HOURS <= 0:
+        return 0
+
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, confidence, last_confirmed_ts FROM locations WHERE active=1"
+    ).fetchall()
+
+    now     = time.time()
+    updated = 0
+    for row in rows:
+        hours_since = (now - row["last_confirmed_ts"]) / 3600.0
+        decayed     = row["confidence"] * math.exp(
+            -math.log(2) * hours_since / LOCATION_DECAY_HALFLIFE_HOURS
+        )
+        new_conf = max(LOCATION_DECAY_FLOOR, decayed)
+        if abs(new_conf - row["confidence"]) > 0.001:
+            db.execute(
+                "UPDATE locations SET confidence=? WHERE id=?",
+                (round(new_conf, 4), row["id"]),
+            )
+            updated += 1
+
+    db.commit()
+    db.close()
+    log.info(f"Location decay: updated {updated} location record(s).")
+    return updated
+
+
 async def _prune_readings() -> int:
     """
     Delete raw readings older than RETENTION_DAYS.
@@ -3165,6 +3242,8 @@ async def pattern_engine_loop():
                 log.info(f"Pattern engine: consolidated {n} near-duplicate memories.")
             log.info("Pattern engine: decaying memory confidence…")
             await _decay_memories()
+            log.info("Pattern engine: decaying location confidence…")
+            await _decay_locations()
             log.info("Pattern engine: consolidating episode memories…")
             n_ep = await _consolidate_episodes()
             if n_ep:
@@ -3182,6 +3261,191 @@ async def pattern_engine_loop():
         except Exception as e:
             log.error(f"Pattern engine error: {e}")
         await asyncio.sleep(PATTERN_INTERVAL)
+
+
+# ── Spatial / location memory tools ────────────────────────────────────────────
+
+async def tool_locate(
+    entity_name: str,
+    container_name: str,
+    entity_type: str = "object",
+    container_type: str = "room",
+    confidence: float = 1.0,
+    source: str = "manual",
+    note: str | None = None,
+) -> str:
+    """
+    Store or update where an object was last seen.
+
+    Creates the object entity (type='object') and container entity (type='room')
+    if they do not exist.  Behaviour:
+      • Same container as current active location → refreshes last_confirmed_ts.
+      • Different container → archives the old location (active=0) and inserts a
+        new active row, so history is preserved.
+      • No existing location → inserts the first active row.
+    """
+    db  = get_db()
+    now = time.time()
+    eid = upsert_entity(db, entity_name, entity_type)
+    cid = upsert_entity(db, container_name, container_type)
+
+    existing = db.execute(
+        "SELECT id, container_id FROM locations WHERE entity_id=? AND active=1",
+        (eid,),
+    ).fetchone()
+
+    if existing:
+        if existing["container_id"] == cid:
+            # Same spot — refresh the confirmation timestamp and confidence.
+            db.execute(
+                "UPDATE locations SET confidence=?, last_confirmed_ts=?, source=?, note=? WHERE id=?",
+                (min(1.0, float(confidence)), now, source, note, existing["id"]),
+            )
+            db.commit()
+            db.close()
+            return f"Confirmed: {entity_name!r} is still at {container_name!r}."
+        else:
+            # Moved — archive the previous location.
+            db.execute("UPDATE locations SET active=0 WHERE id=?", (existing["id"],))
+
+    db.execute(
+        "INSERT INTO locations "
+        "(entity_id, container_id, container_name, confidence, last_confirmed_ts, active, source, note, created) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        (eid, cid, container_name, min(1.0, float(confidence)), now, source, note, now),
+    )
+    db.commit()
+    db.close()
+    return f"Located: {entity_name!r} is at {container_name!r}."
+
+
+async def tool_find(entity_name: str) -> str:
+    """
+    Return the last known location of an object with confidence and age.
+
+    Also shows the previous location when available, so the user can search
+    nearby spots if the object has moved.
+    """
+    db  = get_db()
+    now = time.time()
+
+    current = db.execute(
+        """SELECT l.container_name, l.confidence, l.last_confirmed_ts, l.note
+           FROM locations l
+           JOIN entities e ON e.id = l.entity_id
+           WHERE e.name=? AND l.active=1""",
+        (entity_name,),
+    ).fetchone()
+
+    if not current:
+        # No active row — check historical records.
+        prev = db.execute(
+            """SELECT l.container_name, l.confidence, l.last_confirmed_ts
+               FROM locations l
+               JOIN entities e ON e.id = l.entity_id
+               WHERE e.name=? AND l.active=0
+               ORDER BY l.last_confirmed_ts DESC LIMIT 1""",
+            (entity_name,),
+        ).fetchone()
+        db.close()
+        if prev:
+            age = _format_age(now - prev["last_confirmed_ts"])
+            return (
+                f"No current location for {entity_name!r}. "
+                f"Previously seen at {prev['container_name']!r} "
+                f"({age} ago, conf={prev['confidence']:.0%})."
+            )
+        return f"No location recorded for {entity_name!r}."
+
+    prev = db.execute(
+        """SELECT l.container_name, l.last_confirmed_ts
+           FROM locations l
+           JOIN entities e ON e.id = l.entity_id
+           WHERE e.name=? AND l.active=0
+           ORDER BY l.last_confirmed_ts DESC LIMIT 1""",
+        (entity_name,),
+    ).fetchone()
+    db.close()
+
+    age      = _format_age(now - current["last_confirmed_ts"])
+    conf_pct = f"{current['confidence']:.0%}"
+    note_str = f" ({current['note']})" if current["note"] else ""
+    lines    = [
+        f"{entity_name!r} was last seen at {current['container_name']!r}{note_str} "
+        f"— {age} ago (confidence: {conf_pct})."
+    ]
+    if prev:
+        prev_age = _format_age(now - prev["last_confirmed_ts"])
+        lines.append(f"Previously at {prev['container_name']!r} ({prev_age} ago).")
+
+    return "\n".join(lines)
+
+
+async def tool_seen_at(entity_name: str, container_name: str) -> str:
+    """
+    Confirm that an object is still at the given location.
+
+    Bumps confidence by LOCATION_CONFIDENCE_BOOST (capped at 1.0) and
+    refreshes last_confirmed_ts.  If the object's active location is a
+    different container, delegates to tool_locate to record the new sighting.
+    """
+    db  = get_db()
+    now = time.time()
+    row = db.execute(
+        """SELECT l.id, l.confidence, l.container_name
+           FROM locations l
+           JOIN entities e ON e.id = l.entity_id
+           WHERE e.name=? AND l.active=1""",
+        (entity_name,),
+    ).fetchone()
+
+    if row and row["container_name"].lower() == container_name.lower():
+        new_conf = min(1.0, row["confidence"] + LOCATION_CONFIDENCE_BOOST)
+        db.execute(
+            "UPDATE locations SET confidence=?, last_confirmed_ts=? WHERE id=?",
+            (round(new_conf, 4), now, row["id"]),
+        )
+        db.commit()
+        db.close()
+        return (
+            f"Confirmed: {entity_name!r} still at {container_name!r} "
+            f"(confidence now {new_conf:.0%})."
+        )
+
+    db.close()
+    # Object not at this container — treat as a new sighting.
+    return await tool_locate(entity_name, container_name, source="confirmation")
+
+
+async def tool_location_history(entity_name: str, limit: int = 10) -> str:
+    """Return the location history of an object — current and all past sightings."""
+    limit = max(1, min(100, int(limit)))
+    db    = get_db()
+    rows  = db.execute(
+        """SELECT l.container_name, l.confidence, l.last_confirmed_ts, l.active, l.note
+           FROM locations l
+           JOIN entities e ON e.id = l.entity_id
+           WHERE e.name=?
+           ORDER BY l.last_confirmed_ts DESC
+           LIMIT ?""",
+        (entity_name, limit),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return f"No location history for {entity_name!r}."
+
+    now   = time.time()
+    lines = [f"Location history for {entity_name!r} ({len(rows)} sighting(s)):"]
+    for r in rows:
+        age      = _format_age(now - r["last_confirmed_ts"])
+        status   = "current" if r["active"] else "previous"
+        note_str = f" — {r['note']}" if r["note"] else ""
+        lines.append(
+            f"  [{status}] {r['container_name']!r}{note_str} "
+            f"— {age} ago (conf={r['confidence']:.0%})"
+        )
+    return "\n".join(lines)
 
 
 # ── MCP Server wiring ──────────────────────────────────────────────────────────
@@ -3455,6 +3719,55 @@ TOOLS = [
          inputSchema={"type":"object","properties":{
              "entity_name":{"type":"string"},
              "active_only":{"type":"boolean","default":True}}}),
+    # Spatial / location memory
+    Tool(name="locate",
+         description=(
+             "Store or update the last-known location of an object. "
+             "Creates the object and container entities if they do not exist. "
+             "If the object is already recorded at this location, refreshes the "
+             "confirmation timestamp. If it has moved, the old location is archived."
+         ),
+         inputSchema={"type":"object","required":["entity_name","container_name"],"properties":{
+             "entity_name":  {"type":"string",
+                 "description":"The object being located (e.g. 'keys', 'TV remote', 'passport')"},
+             "container_name":{"type":"string",
+                 "description":"Where it was seen (e.g. 'entryway table', 'kitchen counter', 'bedroom drawer')"},
+             "entity_type":  {"type":"string","default":"object",
+                 "description":"Entity type for the object (default: 'object')"},
+             "container_type":{"type":"string","default":"room",
+                 "description":"Entity type for the container (default: 'room')"},
+             "confidence":   {"type":"number","default":1.0,
+                 "description":"Confidence 0.0–1.0 (default 1.0); decays over time"},
+             "source":       {"type":"string","default":"manual"},
+             "note":         {"type":"string",
+                 "description":"Optional spatial detail (e.g. 'on top shelf', 'inside blue bag')"}}}),
+    Tool(name="find",
+         description=(
+             "Return the last known location of an object with confidence level "
+             "and time since last confirmed. Also shows the previous location when "
+             "available so the user knows where else to check."
+         ),
+         inputSchema={"type":"object","required":["entity_name"],"properties":{
+             "entity_name":{"type":"string",
+                 "description":"The object to find (e.g. 'keys', 'TV remote', 'book')"}}}),
+    Tool(name="seen_at",
+         description=(
+             "Confirm that an object is still at a location. "
+             "Bumps confidence and refreshes the last-confirmed timestamp. "
+             "Use this when you can directly verify the object is in place."
+         ),
+         inputSchema={"type":"object","required":["entity_name","container_name"],"properties":{
+             "entity_name":   {"type":"string"},
+             "container_name":{"type":"string"}}}),
+    Tool(name="location_history",
+         description=(
+             "Return the full location history of an object — current and all "
+             "past sightings in reverse-chronological order."
+         ),
+         inputSchema={"type":"object","required":["entity_name"],"properties":{
+             "entity_name":{"type":"string"},
+             "limit":{"type":"integer","default":10,
+                 "description":"Maximum sightings to return (1–100, default 10)"}}}),
 ]
 
 
@@ -3497,6 +3810,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         "check_intentions":     tool_check_intentions,
         "dismiss_intention":    tool_dismiss_intention,
         "list_intentions":      tool_list_intentions,
+        "locate":               tool_locate,
+        "find":                 tool_find,
+        "seen_at":              tool_seen_at,
+        "location_history":     tool_location_history,
     }
     fn = dispatch.get(name)
     if not fn:
