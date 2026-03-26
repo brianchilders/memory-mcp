@@ -818,12 +818,83 @@ Export all entities. Returns a JSON object mapping `{entity_name}.md` → markdo
 
 To write all files to an Obsidian vault directory:
 ```python
-import json, pathlib, requests
+import pathlib, requests
 
 vault = pathlib.Path("/path/to/obsidian/vault")
 files = requests.get("http://localhost:8900/export/markdown").json()["files"]
 for filename, content in files.items():
     (vault / filename).write_text(content)
+```
+
+---
+
+### `POST /import/markdown`
+
+Import entities from Obsidian-compatible Markdown files. Accepts the same
+`{ files: {...} }` shape that `GET /export/markdown` returns — making
+export → edit → import a clean round-trip.
+
+Requires `Authorization: Bearer <token>` (write operation).
+
+**Request:**
+```json
+{
+  "files": {
+    "Brian.md":         "---\ntype: person\n...\n# Brian\n\n## Observations\n\n- Prefers dark roast\n",
+    "homeassistant.md": "---\ntype: device\n...\n# homeassistant\n\n## Observations\n\n- Smart home hub\n"
+  }
+}
+```
+
+**Parse rules:**
+
+| Element | Source |
+|---|---|
+| Entity name | First `# H1` heading; falls back to filename stem (minus `.md`) |
+| Entity type | Frontmatter `type:` field; defaults to `"person"` |
+| Observations | Bullet items under `## Observations`; `### Category` sub-headings set the category |
+| Relations | Bullet items under `## Relations` matching `- [[other_name]] — rel_type` (em-dash, en-dash, or hyphen) |
+
+**Idempotency:**
+- Memories: a fact with the same text as an existing memory is skipped, not duplicated (`memories_skipped`)
+- Relations: re-importing an active relation is a no-op (no error, no duplicate)
+
+**Response:**
+```json
+{
+  "imported": {
+    "Brian": {
+      "status":            "created",
+      "memories_added":    2,
+      "memories_skipped":  0,
+      "relations_added":   1
+    },
+    "homeassistant": {
+      "status":            "created",
+      "memories_added":    1,
+      "memories_skipped":  0,
+      "relations_added":   0
+    }
+  },
+  "errors": [],
+  "ok": true
+}
+```
+
+`status` is `"created"` if the entity was new, `"existing"` if it already existed.
+`errors` contains entries for files that failed to parse or import entirely.
+
+**To import from an Obsidian vault directory:**
+```python
+import pathlib, requests
+
+vault = pathlib.Path("/path/to/obsidian/vault")
+files = {p.name: p.read_text() for p in vault.glob("*.md")}
+result = requests.post(
+    "http://localhost:8900/import/markdown",
+    json={"files": files},
+    headers={"Authorization": "Bearer <token>"},
+).json()
 ```
 
 ---

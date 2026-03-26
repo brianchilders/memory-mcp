@@ -13,16 +13,37 @@ Run:
     # or with auto-reload during dev:
     uvicorn api:app --host 0.0.0.0 --port 8900 --reload
 
-Endpoints mirror MCP tool names:
-    POST /remember          POST /record
-    POST /recall            POST /query_stream
-    GET  /profile/{name}    POST /get_trends
-    POST /relate            POST /schedule
-    POST /forget            POST /cross_query
-    GET  /entities          GET  /health
+Endpoints:
+    GET  /health                GET  /entities
+    POST /remember              POST /recall
+    POST /get_context           GET  /profile/{name}
+    POST /relate                POST /unrelate
+    POST /forget
+
+    POST /open_session          POST /log_turn
+    POST /close_session         GET  /get_session/{id}
+    POST /extract_and_remember
+
+    POST /record                POST /record/bulk
+    POST /query_stream          POST /get_trends
+    POST /schedule              POST /cross_query
+    POST /prune
+
+    GET  /graph                 GET  /api/graph
+    GET  /export/markdown       GET  /export/markdown/{name}
+    POST /import/markdown
+
+    GET  /voices/unknown        POST /voices/enroll
+    POST /voices/merge          POST /voices/update_print
+
+    GET  /admin/                GET  /admin/entities
+    GET  /admin/entity/{name}   GET  /admin/readings
+    GET  /admin/settings        POST /admin/token/regenerate
+    POST /admin/prune
 """
 
 import asyncio
+import json
 import time
 import urllib.error
 import urllib.request
@@ -44,7 +65,11 @@ import server as mem
 from admin import router as admin_router
 from voice_routes import router as voice_router
 from graph_routes import router as graph_router
-from exporters.markdown import entity_to_markdown, export_all as export_all_markdown
+from exporters.markdown import (
+    entity_to_markdown,
+    export_all as export_all_markdown,
+    import_files as import_markdown_files,
+)
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
@@ -319,7 +344,7 @@ async def list_entities():
     return {
         "entities": [
             {"name": r["name"], "type": r["type"],
-             "meta": __import__("json").loads(r["meta"]),
+             "meta": json.loads(r["meta"]),
              "updated": r["updated"]}
             for r in rows
         ]
@@ -451,6 +476,11 @@ async def prune():
 class BulkRecordRequest(BaseModel):
     readings: list[RecordRequest]
 
+class ImportMarkdownRequest(BaseModel):
+    files: dict[str, str] = Field(
+        description="Mapping of filename → markdown content, e.g. {'Brian.md': '---\\ntype: person\\n...'}"
+    )
+
 @app.post("/record/bulk")
 async def record_bulk(req: BulkRecordRequest):
     """
@@ -468,6 +498,33 @@ async def record_bulk(req: BulkRecordRequest):
 
 
 # ── Markdown export ────────────────────────────────────────────────────────────
+
+@app.post("/import/markdown")
+async def import_markdown(req: ImportMarkdownRequest):
+    """
+    Import entities from Obsidian-compatible Markdown files.
+
+    Accepts the same ``{ files: { "Brian.md": "...", ... } }`` shape that
+    ``GET /export/markdown`` returns — making export → edit → import a clean
+    round-trip.
+
+    Each file is parsed for:
+
+    - Entity name (``# H1`` heading, or filename stem as fallback)
+    - Entity type (frontmatter ``type:`` field, default ``"person"``)
+    - Memories (``## Observations`` bullets, grouped by ``### Category``)
+    - Relations (``## Relations`` bullets: ``- [[other_name]] — rel_type``)
+
+    Memories are **deduplicated** — an existing fact with the same text is
+    counted in ``memories_skipped`` rather than re-inserted.
+    Relations are **idempotent** — re-importing an active relation is a no-op.
+    """
+    try:
+        result = await import_markdown_files(req.files)
+        return {**result, "ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/export/markdown/{entity_name}")
 async def export_markdown_entity(entity_name: str):

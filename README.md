@@ -24,7 +24,7 @@ that any ability can recall semantically (Tier 1).
 | `admin.py`        | Admin UI router (served at `/admin`)                 |
 | `voice_routes.py` | Speaker identity API (`/voices/*` — enroll, merge, update voiceprints) |
 | `graph_routes.py` | Entity graph API (`/graph` SPA + `/api/graph` data endpoint) |
-| `exporters/markdown.py` | Markdown export logic (Obsidian-compatible `.md` files) |
+| `exporters/markdown.py` | Markdown two-way sync — export and import of Obsidian-compatible `.md` files |
 | `reembed.py`      | Utility to re-embed all memories when swapping models|
 | `templates/admin` | Jinja2 HTML templates for the admin UI               |
 | `templates/graph` | vis.js entity graph SPA template                    |
@@ -97,7 +97,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (372 tests, no Ollama needed)
+python -m pytest                     # full suite (408 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -232,6 +232,7 @@ GET  /api/graph                 entity graph data { nodes, edges }
 
 GET  /export/markdown           export all entities as Obsidian-compatible Markdown
 GET  /export/markdown/{name}    export single entity as .md file download
+POST /import/markdown           import entities from Markdown files (two-way sync)
 
 GET  /admin/                    dashboard
 GET  /admin/entities            entity list

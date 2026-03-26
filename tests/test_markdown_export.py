@@ -28,12 +28,12 @@ def client(api_auth):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _remember(client, name, fact, category="general", entity_type="person"):
+def _remember(client, name, fact, entity_type="person", category="general"):
     r = client.post("/remember", json={
         "entity_name": name,
         "fact":        fact,
-        "category":    category,
         "entity_type": entity_type,
+        "category":    category,
     })
     assert r.status_code == 200, r.text
 
@@ -92,15 +92,15 @@ def test_export_single_has_observations_section(client):
 
 
 def test_export_single_includes_all_facts(client):
-    _remember(client, "Brian", "Works on OpenHome",  "general")
-    _remember(client, "Brian", "Prefers dark roast", "preference")
+    _remember(client, "Brian", "Works on OpenHome",  category="general")
+    _remember(client, "Brian", "Prefers dark roast", category="preference")
     text = client.get("/export/markdown/Brian").text
     assert "Works on OpenHome"  in text
     assert "Prefers dark roast" in text
 
 
 def test_export_single_groups_by_category(client):
-    _remember(client, "Brian", "Prefers coffee", "preference")
+    _remember(client, "Brian", "Prefers coffee", category="preference")
     text = client.get("/export/markdown/Brian").text
     assert "### Preference" in text or "### preference" in text
 
