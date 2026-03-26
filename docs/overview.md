@@ -445,9 +445,12 @@ It works with a local [Ollama](https://ollama.ai) instance for embeddings and
 LLM inference, and it is fully compatible with any OpenAI-compatible provider if
 you prefer cloud models. Switching providers is one environment variable.
 
-It also runs on a **Raspberry Pi**. The keyword retrieval mode (`recall_mode=
-"keyword"`) bypasses the embedding model entirely — FTS5/BM25 search works with
-no GPU, no Ollama, and no network access. The token-budget context tool
+It also runs on a **Raspberry Pi**. A Pi 4 with 4 GB RAM can run
+`nomic-embed-text` via Ollama (~270 MB quantized, 50–150 ms per embedding on
+CPU), making full vector search viable without any cloud dependency. For
+even lighter deployments, the keyword retrieval mode (`recall_mode="keyword"`)
+bypasses the embedding model entirely — FTS5/BM25 search works with no GPU, no
+Ollama, and no network access. The token-budget context tool
 (`get_context_budget`) keeps responses within the limits of smaller models by
 greedily filling a configurable token budget and signalling when items were
 omitted.

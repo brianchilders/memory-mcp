@@ -163,6 +163,36 @@ and heavy.  You can route them to different machines.
 Set `MEMORY_LLM_BASE_URL` (and optionally `MEMORY_LLM_API_KEY`) to override
 the LLM destination.  The embed backend continues to use `MEMORY_AI_BASE_URL`.
 
+### Example: Raspberry Pi 4 for embed, GPU machine for LLM
+
+`nomic-embed-text` runs comfortably on a Raspberry Pi 4 with 4 GB RAM.
+The quantized model is ~270 MB and produces embeddings in roughly 50–150 ms
+on the Pi's CPU — fast enough for all real-time memory operations since
+embeddings are called one at a time on user-driven events, not in batch.
+
+```bash
+# On the Pi — install Ollama and pull the embed model
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull nomic-embed-text
+
+# By default Ollama only listens on localhost.
+# To accept connections from other machines on the LAN:
+OLLAMA_HOST=0.0.0.0 ollama serve
+```
+
+Then on the machine running memory-mcp:
+
+```bash
+# Embed — Raspberry Pi on the LAN (CPU, always running)
+export MEMORY_AI_BASE_URL=http://pi4.local:11434/v1
+export MEMORY_EMBED_MODEL=nomic-embed-text
+export MEMORY_EMBED_DIM=768
+
+# LLM — separate machine with a GPU
+export MEMORY_LLM_BASE_URL=http://gpu-host.local:11434/v1
+export MEMORY_LLM_MODEL=llama3.2
+```
+
 ### Example: local embed, GPU machine for LLM
 
 ```bash
