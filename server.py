@@ -237,6 +237,7 @@ def get_db() -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     sqlite_vec.load(db)
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")   # safe with WAL; avoids fsync on every write
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
@@ -3868,14 +3869,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=result)]
 
 
+def _shutdown_db() -> None:
+    """Checkpoint and truncate the WAL file so the DB is fully self-contained on exit."""
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.close()
+        log.info("SQLite WAL checkpoint complete.")
+    except Exception:
+        log.exception("SQLite WAL checkpoint failed on shutdown.")
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
     asyncio.create_task(pattern_engine_loop())
-    async with stdio_server() as (r, w):
-        await server.run(r, w, server.create_initialization_options())
+    try:
+        async with stdio_server() as (r, w):
+            await server.run(r, w, server.create_initialization_options())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        log.info("memory-mcp server shutting down.")
+        _shutdown_db()
 
 
 if __name__ == "__main__":
     setup_logging()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
