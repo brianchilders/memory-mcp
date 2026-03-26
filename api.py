@@ -152,6 +152,7 @@ _AUTH_EXEMPT = (
     "/openapi",
     "/redoc",
     "/favicon.ico",
+    "/static/vendor",    # vendored CSS/JS assets needed by admin UI and graph SPA
     "/graph",            # vis.js SPA — protect at network layer like /admin
 )
 
@@ -161,11 +162,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
     Require 'Authorization: Bearer <token>' on all API endpoints.
 
     Exemptions (no token needed):
-      /health        — uptime monitoring
-      /admin/*       — admin UI (protect at network layer instead)
-      /graph         — vis.js SPA (protect at network layer instead)
-      /docs, /redoc  — Swagger / ReDoc UI
-      /openapi.json  — OpenAPI schema
+      /health           — uptime monitoring
+      /admin/*          — admin UI (protect at network layer instead)
+      /graph            — vis.js SPA (protect at network layer instead)
+      /static/vendor/*  — vendored CSS/JS required by admin UI and graph SPA
+      /docs, /redoc     — Swagger / ReDoc UI
+      /openapi.json     — OpenAPI schema
 
     Auth is disabled entirely when no token is configured (MEMORY_API_TOKEN not set
     and no token in the database). In that case all requests pass through.
