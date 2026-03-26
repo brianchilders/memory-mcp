@@ -101,7 +101,10 @@ if _raw:
     try:
         _decay_halflife_by_category = {k: float(v) for k, v in json.loads(_raw).items()}
     except Exception:
-        pass  # misconfigured — fall back to global only
+        log.warning(
+            "MEMORY_DECAY_CATEGORY_HALFLIFE is not valid JSON — ignoring, using global default only. Value: %r",
+            _raw,
+        )
 
 DECAY_CONFIDENCE_FLOOR = 0.05
 DECAY_RECALL_BOOST     = 0.05   # confidence nudge applied when a memory is recalled

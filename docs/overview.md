@@ -78,7 +78,7 @@ changes needed.
 
 Two interfaces are available simultaneously:
 
-- **MCP stdio server** (`server.py`) — 31 tools exposed over the Model Context
+- **MCP stdio server** (`server.py`) — 35 tools exposed over the Model Context
   Protocol. Connect any MCP-compatible AI framework.
 - **HTTP API + admin UI** (`api.py`) — FastAPI server on port 8900 with REST
   endpoints, auto-generated Swagger docs at `/docs`, and a web dashboard at

@@ -18,6 +18,7 @@ startup; no code changes are needed to switch providers.
 | `MEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
 | `MEMORY_EMBED_DIM` | `768` | Embedding vector dimension — **must match the model** |
 | `MEMORY_LLM_MODEL` | `llama3.2` | Chat/generation model for `extract_and_remember` |
+| `MEMORY_AI_TIMEOUT` | `30` | HTTP timeout in seconds for embedding calls; LLM calls use `max(timeout, 60)` |
 
 ## Provider Examples
 

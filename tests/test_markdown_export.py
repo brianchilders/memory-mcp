@@ -174,21 +174,18 @@ def test_export_all_content_is_valid_markdown(client):
     assert "Likes hiking" in content
 
 
-# ── Auth exemption ────────────────────────────────────────────────────────────
+# ── Auth required ─────────────────────────────────────────────────────────────
 
-def test_export_single_accessible_without_auth(api_auth):
-    """Export is auth-exempt so <a href> downloads work without JS fetch trickery."""
+def test_export_single_requires_auth(api_auth):
+    """Export endpoints must require authentication — they expose all memory data."""
     import api
     with TestClient(api.app) as unauthenticated:
-        # Need an entity — create one via the authenticated path first
-        with TestClient(api.app, headers={"Authorization": f"Bearer {api_auth}"}) as c:
-            _remember(c, "Alice", "Fact")
         r = unauthenticated.get("/export/markdown/Alice")
-        assert r.status_code == 200
+        assert r.status_code == 401
 
 
-def test_export_all_accessible_without_auth(client):
+def test_export_all_requires_auth(client):
     import api
     with TestClient(api.app) as unauthenticated:
         r = unauthenticated.get("/export/markdown")
-        assert r.status_code == 200
+        assert r.status_code == 401

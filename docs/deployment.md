@@ -54,12 +54,21 @@ MEMORY_EMBED_MODEL=nomic-embed-text
 MEMORY_EMBED_DIM=768
 MEMORY_LLM_MODEL=llama3.2
 
+# AI call timeout in seconds (embedding calls; LLM calls use max(timeout, 60))
+# Increase if using a slow local model
+# MEMORY_AI_TIMEOUT=30
+
 # Database — use an absolute path so it doesn't depend on working directory
 MEMORY_DB_PATH=/var/lib/memory-mcp/memory.db
 
 # API token — leave unset to use the auto-generated token (recommended)
 # Set this only if you want a fixed, known token (e.g. for scripted provisioning)
 # MEMORY_API_TOKEN=your-token-here
+
+# CORS — restrict to specific origins if the server is reachable beyond localhost
+# Default is "*" (allow all), which is safe for a private LAN but should be
+# locked down if the port is exposed to the internet or untrusted networks
+# MEMORY_CORS_ORIGINS=http://homeassistant.local,http://localhost:3000
 ```
 
 The server reads `.env` in the working directory automatically on startup

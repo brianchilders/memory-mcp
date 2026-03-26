@@ -19,7 +19,7 @@ that any ability can recall semantically (Tier 1).
 
 | File              | Purpose                                              |
 |-------------------|------------------------------------------------------|
-| `server.py`       | MCP server (stdio transport, all 11 tools)           |
+| `server.py`       | MCP server (stdio transport, all 35 tools)           |
 | `api.py`          | FastAPI HTTP wrapper + admin UI mount                |
 | `admin.py`        | Admin UI router (served at `/admin`)                 |
 | `voice_routes.py` | Speaker identity API (`/voices/*` — enroll, merge, update voiceprints) |

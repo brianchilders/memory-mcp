@@ -47,6 +47,7 @@ Endpoints:
 """
 
 import asyncio
+import hmac
 import json
 import time
 import urllib.error
@@ -152,7 +153,6 @@ _AUTH_EXEMPT = (
     "/redoc",
     "/favicon.ico",
     "/graph",            # vis.js SPA — protect at network layer like /admin
-    "/export/markdown",  # browser download; auth-exempt so <a href> works directly
 )
 
 
@@ -163,6 +163,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     Exemptions (no token needed):
       /health        — uptime monitoring
       /admin/*       — admin UI (protect at network layer instead)
+      /graph         — vis.js SPA (protect at network layer instead)
       /docs, /redoc  — Swagger / ReDoc UI
       /openapi.json  — OpenAPI schema
 
@@ -186,7 +187,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if auth_header[7:] != expected:
+        if not hmac.compare_digest(auth_header[7:], expected):
             mem.log.warning("Auth failure from %s", request.client.host if request.client else "unknown")
             return JSONResponse(
                 {"ok": False, "error": "Invalid bearer token"},
