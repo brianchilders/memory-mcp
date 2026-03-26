@@ -17,11 +17,25 @@ cd memory-mcp
 
 ## 2. Install Python dependencies
 
+Using a virtual environment is strongly recommended. It isolates memory-mcp's
+dependencies from the rest of your system and is required if you plan to run
+the server under systemd (see `docs/deployment.md`).
+
 ```bash
+# Create and activate a venv inside the repo
+python3 -m venv venv
+source venv/bin/activate   # on Windows: venv\Scripts\activate
+
+# Install all dependencies
 pip install -r requirements.txt
 ```
 
-Or individually:
+The venv only needs to be activated for interactive use. When running under
+systemd, point `ExecStart` directly at `venv/bin/python` — no activation
+needed. See [Running as a systemd service](deployment.md#running-as-a-systemd-service)
+for the full setup.
+
+Or install individually:
 ```bash
 pip install mcp sqlite-vec httpx fastapi uvicorn jinja2 python-dotenv
 ```
@@ -34,11 +48,6 @@ pip install "paho-mqtt>=2.0"
 For running tests:
 ```bash
 pip install pytest pytest-asyncio pytest-httpx
-```
-
-All dependencies in one command:
-```bash
-pip install -r requirements.txt
 ```
 
 ## 3. Set up an AI backend

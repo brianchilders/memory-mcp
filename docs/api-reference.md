@@ -710,6 +710,124 @@ refine the embedding over time. Result is re-normalized to a unit vector.
 
 ---
 
+## Entity Graph
+
+### `GET /graph`
+
+Serves the vis.js entity relationship graph as a standalone web page.
+Auth-exempt — protected at the network layer like `/admin`.
+
+Open in a browser: `http://localhost:8900/graph`
+
+- Nodes represent entities, sized by memory count, coloured by type
+- Edges represent active directed relations with their `rel_type` as labels
+- Click any node to see its memories in a sidebar panel
+- "Export .md" button in the sidebar downloads the entity as Markdown
+
+---
+
+### `GET /api/graph`
+
+Return the entity relationship graph as JSON for the vis.js frontend.
+Requires `Authorization: Bearer <token>` (token injected into the SPA automatically).
+
+**Response:**
+```json
+{
+  "nodes": [
+    {
+      "id":           1,
+      "name":         "Brian",
+      "type":         "person",
+      "memory_count": 12,
+      "memories": [
+        {"fact": "Prefers dark roast coffee", "category": "preference", "confidence": 0.9}
+      ]
+    }
+  ],
+  "edges": [
+    {"from": 1, "to": 2, "label": "spouse"}
+  ]
+}
+```
+
+- `nodes.memories` — active memories only (`superseded_by IS NULL`)
+- `edges` — active directed relations only (`valid_until IS NULL`)
+- vis.js uses `from`/`to` for edge endpoints
+
+---
+
+## Markdown Export
+
+Exports entity memories in Obsidian-compatible Markdown format:
+YAML frontmatter + `## Observations` (active memories, grouped by category) +
+`## Relations` (`[[wikilinks]]` for active directed relations).
+
+Both endpoints are auth-exempt so browsers can download files directly
+via `<a href>` without needing JS fetch with an auth header.
+
+### `GET /export/markdown/{entity_name}`
+
+Export a single entity as a `.md` file download.
+
+**Response:** `text/plain` with `Content-Disposition: attachment; filename="{entity_name}.md"`
+
+**Example output:**
+```markdown
+---
+type: person
+created: 2026-01-15T08:30:00
+updated: 2026-03-25T14:22:00
+tags: [memory, auto]
+---
+
+# Brian
+
+## Observations
+
+### General
+
+- Works on OpenHome AI speaker platform
+
+### Preference
+
+- Prefers dark roast coffee
+
+## Relations
+
+- [[homeassistant]] — controls
+```
+
+**Errors:** `404` if entity not found.
+
+---
+
+### `GET /export/markdown`
+
+Export all entities. Returns a JSON object mapping `{entity_name}.md` → markdown content.
+
+**Response:**
+```json
+{
+  "files": {
+    "Brian.md":         "---\ntype: person\n...",
+    "homeassistant.md": "---\ntype: device\n..."
+  }
+}
+```
+
+To write all files to an Obsidian vault directory:
+```python
+import json, pathlib, requests
+
+vault = pathlib.Path("/path/to/obsidian/vault")
+files = requests.get("http://localhost:8900/export/markdown").json()["files"]
+for filename, content in files.items():
+    (vault / filename).write_text(content)
+```
+
+---
+
 ## Error responses
 
 All endpoints return a JSON error body with an appropriate HTTP status code.

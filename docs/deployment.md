@@ -102,6 +102,34 @@ docker compose ps
 
 ## Running as a systemd service
 
+### Python virtual environment and systemd
+
+If you installed dependencies into a virtual environment (recommended — see
+`docs/installation.md`), you **must** point `ExecStart` at the venv's Python
+binary directly. systemd does not source `.bashrc`, `.profile`, or any shell
+activation script, so `source venv/bin/activate` is never called and the
+system Python would be used instead.
+
+The fix is simple: replace `/usr/bin/python3` with the full path to the venv
+Python. If your venv is at `/home/brian/memory-mcp/venv`, then:
+
+```
+ExecStart=/home/brian/memory-mcp/venv/bin/python api.py
+```
+
+The venv Python binary has the correct `sys.path` baked in at creation time —
+no activation needed. To confirm the path on your machine:
+
+```bash
+# With the venv activated
+which python
+# → /home/brian/memory-mcp/venv/bin/python
+```
+
+Use that path in all `ExecStart` lines below, replacing `/path/to/memory-mcp/venv/bin/python`.
+
+---
+
 ### HTTP API + admin UI
 
 Create `/etc/systemd/system/memory-mcp.service`:
@@ -117,7 +145,7 @@ Type=simple
 User=your-username
 WorkingDirectory=/path/to/memory-mcp
 EnvironmentFile=/etc/memory-mcp/env
-ExecStart=/usr/bin/python3 api.py
+ExecStart=/path/to/memory-mcp/venv/bin/python api.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -157,7 +185,7 @@ EnvironmentFile=/etc/memory-mcp/env
 Environment=MEMORY_MQTT_BROKER=your-broker-host
 Environment=MEMORY_API_URL=http://localhost:8900
 Environment=MEMORY_MQTT_MAPPINGS=/path/to/memory-mcp/integrations/mqtt_mappings.json
-ExecStart=/usr/bin/python3 integrations/mqtt_bridge.py
+ExecStart=/path/to/memory-mcp/venv/bin/python integrations/mqtt_bridge.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -190,7 +218,7 @@ Environment=HA_URL=http://homeassistant.local:8123
 Environment=HA_TOKEN=your-long-lived-access-token
 Environment=MEMORY_API_URL=http://localhost:8900
 Environment=MEMORY_API_TOKEN=your-memory-mcp-token
-ExecStart=/usr/bin/python3 integrations/ha_state_poller.py
+ExecStart=/path/to/memory-mcp/venv/bin/python integrations/ha_state_poller.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

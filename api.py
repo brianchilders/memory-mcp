@@ -43,6 +43,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import server as mem
 from admin import router as admin_router
 from voice_routes import router as voice_router
+from graph_routes import router as graph_router
+from exporters.markdown import entity_to_markdown, export_all as export_all_markdown
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
@@ -110,7 +112,16 @@ app.add_middleware(
 
 # ── Bearer token authentication ────────────────────────────────────────────────
 # Paths that bypass auth (monitoring + admin UI + API docs)
-_AUTH_EXEMPT = ("/health", "/admin", "/docs", "/openapi", "/redoc", "/favicon.ico")
+_AUTH_EXEMPT = (
+    "/health",
+    "/admin",
+    "/docs",
+    "/openapi",
+    "/redoc",
+    "/favicon.ico",
+    "/graph",            # vis.js SPA — protect at network layer like /admin
+    "/export/markdown",  # browser download; auth-exempt so <a href> works directly
+)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -157,6 +168,7 @@ app.add_middleware(AuthMiddleware)
 
 app.include_router(admin_router)
 app.include_router(voice_router)
+app.include_router(graph_router)
 
 
 # ── Request / response models ──────────────────────────────────────────────────
@@ -453,6 +465,44 @@ async def record_bulk(req: BulkRecordRequest):
         except Exception as e:
             results.append({"ok": False, "error": str(e)})
     return {"results": results, "count": len(results)}
+
+
+# ── Markdown export ────────────────────────────────────────────────────────────
+
+@app.get("/export/markdown/{entity_name}")
+async def export_markdown_entity(entity_name: str):
+    """
+    Export a single entity's memories as Obsidian-compatible Markdown.
+
+    Returns ``text/plain`` with a ``Content-Disposition: attachment`` header
+    so browsers trigger a file download.  Active memories and active relations
+    only (superseded and soft-deleted excluded).
+    """
+    content = entity_to_markdown(entity_name)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"Entity '{entity_name}' not found")
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{entity_name}.md"'},
+    )
+
+
+@app.get("/export/markdown")
+async def export_markdown_all():
+    """
+    Export all entities as Obsidian-compatible Markdown.
+
+    Returns a JSON object mapping ``{entity_name}.md`` → markdown string.
+    Pipe through a script to write individual files to your vault directory::
+
+        import json, pathlib, requests
+        vault = pathlib.Path("/path/to/obsidian/vault")
+        files = requests.get("http://localhost:8900/export/markdown").json()["files"]
+        for filename, content in files.items():
+            (vault / filename).write_text(content)
+    """
+    return {"files": export_all_markdown()}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

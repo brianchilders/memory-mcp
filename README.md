@@ -23,8 +23,11 @@ that any ability can recall semantically (Tier 1).
 | `api.py`          | FastAPI HTTP wrapper + admin UI mount                |
 | `admin.py`        | Admin UI router (served at `/admin`)                 |
 | `voice_routes.py` | Speaker identity API (`/voices/*` — enroll, merge, update voiceprints) |
+| `graph_routes.py` | Entity graph API (`/graph` SPA + `/api/graph` data endpoint) |
+| `exporters/markdown.py` | Markdown export logic (Obsidian-compatible `.md` files) |
 | `reembed.py`      | Utility to re-embed all memories when swapping models|
 | `templates/admin` | Jinja2 HTML templates for the admin UI               |
+| `templates/graph` | vis.js entity graph SPA template                    |
 | `integrations/`   | Standalone tools that connect external systems to memory-mcp via HTTP |
 
 ## Documentation
@@ -94,7 +97,7 @@ See `docs/ai-backend.md` for full configuration guide and provider examples.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                     # full suite (336 tests, no Ollama needed)
+python -m pytest                     # full suite (372 tests, no Ollama needed)
 python -m pytest tests/test_tools.py # just tool tests
 ```
 
@@ -223,6 +226,12 @@ GET  /voices/unknown            list unenrolled provisional speaker entities
 POST /voices/enroll             rename provisional entity to real person
 POST /voices/merge              merge provisional entity into enrolled entity
 POST /voices/update_print       update voiceprint embedding (running average)
+
+GET  /graph                     vis.js entity relationship graph (SPA)
+GET  /api/graph                 entity graph data { nodes, edges }
+
+GET  /export/markdown           export all entities as Obsidian-compatible Markdown
+GET  /export/markdown/{name}    export single entity as .md file download
 
 GET  /admin/                    dashboard
 GET  /admin/entities            entity list

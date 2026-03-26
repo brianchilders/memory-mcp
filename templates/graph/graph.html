@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>memory-mcp — Entity Graph</title>
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body { background: #0f1117; color: #e2e8f0; font-family: system-ui, sans-serif; }
+
+        .topbar {
+            height: 52px;
+            background: #1a1d27;
+            border-bottom: 1px solid #2d3148;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0 1rem;
+        }
+        .topbar-brand {
+            font-weight: 700;
+            color: #818cf8;
+            text-decoration: none;
+            font-size: 1.05rem;
+        }
+        .topbar-brand:hover { color: #a5b4fc; }
+        .stat-pill {
+            background: #2d3148;
+            border-radius: 20px;
+            padding: 2px 12px;
+            font-size: 0.78rem;
+            color: #94a3b8;
+        }
+        .ms-auto-btn {
+            margin-left: auto;
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        #graph-wrap {
+            display: flex;
+            height: calc(100vh - 52px);
+            gap: 0;
+        }
+
+        #graph-canvas {
+            flex: 1;
+            background: #13151f;
+        }
+
+        #detail-panel {
+            width: 300px;
+            min-width: 260px;
+            background: #1a1d27;
+            border-left: 1px solid #2d3148;
+            overflow-y: auto;
+            padding: 1rem;
+            flex-shrink: 0;
+        }
+
+        .detail-placeholder {
+            color: #4b5563;
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+        }
+
+        .entity-name {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #e2e8f0;
+        }
+        .entity-type-badge {
+            font-size: 0.68rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            color: #fff;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+        }
+        .memory-count-label {
+            font-size: 0.78rem;
+            color: #64748b;
+            margin-bottom: 0.75rem;
+        }
+
+        .category-label {
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #64748b;
+            margin-top: 0.9rem;
+            margin-bottom: 0.3rem;
+            font-weight: 600;
+        }
+        .memory-fact {
+            font-size: 0.82rem;
+            border-left: 3px solid #4f46e5;
+            padding: 3px 0 3px 8px;
+            margin-bottom: 5px;
+            color: #cbd5e1;
+            line-height: 1.4;
+        }
+        .memory-fact.faded { opacity: 0.55; border-color: #374151; }
+
+        .detail-divider {
+            border-color: #2d3148;
+            margin: 0.75rem 0;
+        }
+        .detail-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+        .btn-detail {
+            font-size: 0.75rem;
+            padding: 3px 10px;
+            border-radius: 6px;
+            border: 1px solid #374151;
+            background: transparent;
+            color: #94a3b8;
+            text-decoration: none;
+        }
+        .btn-detail:hover { background: #2d3148; color: #e2e8f0; }
+
+        /* Scrollbar */
+        #detail-panel::-webkit-scrollbar { width: 5px; }
+        #detail-panel::-webkit-scrollbar-track { background: #1a1d27; }
+        #detail-panel::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 3px; }
+
+        #status-msg { font-size: 0.78rem; color: #64748b; }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <a class="topbar-brand" href="/admin/">&#x2B22; memory-mcp</a>
+    <span class="stat-pill" id="stat-nodes">&#8212;</span>
+    <span class="stat-pill" id="stat-edges">&#8212;</span>
+    <span id="status-msg">Loading&hellip;</span>
+    <div class="ms-auto-btn">
+        <a href="/admin/" class="btn-detail">Admin</a>
+    </div>
+</div>
+
+<div id="graph-wrap">
+    <div id="graph-canvas"></div>
+    <div id="detail-panel">
+        <p class="detail-placeholder">Click any node to see its memories.</p>
+    </div>
+</div>
+
+<script>
+// ── Auth ──────────────────────────────────────────────────────────────────────
+const API_TOKEN = "{{ api_token }}";
+const AUTH_HEADERS = API_TOKEN ? { "Authorization": `Bearer ${API_TOKEN}` } : {};
+
+// ── Node colours by entity type ───────────────────────────────────────────────
+const TYPE_COLORS = {
+    person: { bg: "#4f46e5", border: "#818cf8" },
+    house:  { bg: "#16a34a", border: "#4ade80" },
+    room:   { bg: "#b45309", border: "#fbbf24" },
+    device: { bg: "#0e7490", border: "#22d3ee" },
+};
+const DEFAULT_COLOR = { bg: "#374151", border: "#6b7280" };
+
+function typeColor(type) {
+    return TYPE_COLORS[type] || DEFAULT_COLOR;
+}
+function nodeSize(n) {
+    return Math.max(14, Math.min(38, 14 + n * 2));
+}
+
+// ── Escaping ──────────────────────────────────────────────────────────────────
+function esc(s) {
+    return String(s ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ── Render sidebar detail panel ───────────────────────────────────────────────
+function renderDetail(node) {
+    const c     = typeColor(node.type);
+    const label = (node.type || "entity");
+    const count = node.memory_count ?? 0;
+
+    // Group memories by category
+    const byCat = {};
+    (node.memories || []).forEach(m => {
+        (byCat[m.category] = byCat[m.category] || []).push(m);
+    });
+
+    let html = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <span style="width:11px;height:11px;border-radius:50%;
+                         background:${c.bg};border:2px solid ${c.border};
+                         display:inline-block;flex-shrink:0"></span>
+            <span class="entity-name">${esc(node.name)}</span>
+            <span class="entity-type-badge" style="background:${c.bg}">${esc(label)}</span>
+        </div>
+        <div class="memory-count-label">${count} memor${count !== 1 ? "ies" : "y"}</div>
+    `;
+
+    if (count > 0) {
+        for (const [cat, mems] of Object.entries(byCat)) {
+            html += `<div class="category-label">${esc(cat)}</div>`;
+            mems.forEach(m => {
+                const faded = m.confidence < 0.6 ? " faded" : "";
+                html += `<div class="memory-fact${faded}">${esc(m.fact)}</div>`;
+            });
+        }
+    } else {
+        html += `<p style="font-size:0.82rem;color:#4b5563">No memories yet.</p>`;
+    }
+
+    html += `
+        <hr class="detail-divider">
+        <div class="detail-actions">
+            <a class="btn-detail"
+               href="/admin/entity/${encodeURIComponent(node.name)}"
+               target="_blank">Admin view</a>
+            <a class="btn-detail"
+               href="/export/markdown/${encodeURIComponent(node.name)}"
+               download="${esc(node.name)}.md">Export .md</a>
+        </div>
+    `;
+
+    document.getElementById("detail-panel").innerHTML = html;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function loadGraph() {
+    const statusEl = document.getElementById("status-msg");
+
+    let data;
+    try {
+        const resp = await fetch("/api/graph", { headers: AUTH_HEADERS });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} — check bearer token`);
+        data = await resp.json();
+    } catch (e) {
+        statusEl.textContent = `Error: ${e.message}`;
+        statusEl.style.color = "#f87171";
+        return;
+    }
+
+    const { nodes: rawNodes, edges: rawEdges } = data;
+
+    // Index for sidebar lookups on node click
+    const nodeIndex = {};
+    rawNodes.forEach(n => { nodeIndex[n.id] = n; });
+
+    const visNodes = new vis.DataSet(rawNodes.map(n => {
+        const c = typeColor(n.type);
+        return {
+            id:    n.id,
+            label: n.name,
+            title: `${n.type} · ${n.memory_count} memor${n.memory_count !== 1 ? "ies" : "y"}`,
+            color: { background: c.bg, border: c.border,
+                     highlight: { background: c.border, border: "#fff" } },
+            size:  nodeSize(n.memory_count),
+            font:  { color: "#e2e8f0", size: 13, face: "system-ui, sans-serif" },
+            shape: "dot",
+        };
+    }));
+
+    const visEdges = new vis.DataSet(rawEdges.map((e, i) => ({
+        id:     i,
+        from:   e.from,
+        to:     e.to,
+        label:  e.label,
+        font:   { color: "#64748b", size: 11, align: "middle" },
+        color:  { color: "#374151", highlight: "#818cf8", hover: "#6366f1" },
+        arrows: { to: { enabled: true, scaleFactor: 0.55 } },
+        smooth: { type: "curvedCW", roundness: 0.12 },
+    })));
+
+    const container = document.getElementById("graph-canvas");
+    const network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, {
+        physics: {
+            enabled: true,
+            solver:  "forceAtlas2Based",
+            forceAtlas2Based: {
+                gravitationalConstant: -55,
+                centralGravity:        0.006,
+                springLength:          130,
+                springConstant:        0.07,
+                damping:               0.42,
+            },
+            stabilization: { iterations: 250, updateInterval: 25 },
+        },
+        interaction: {
+            hover:       true,
+            tooltipDelay: 200,
+            keyboard:    true,
+            zoomView:    true,
+        },
+    });
+
+    network.on("stabilizationIterationsDone", () => {
+        network.setOptions({ physics: { enabled: false } });
+        statusEl.textContent = "";
+    });
+
+    network.on("selectNode", ({ nodes: sel }) => {
+        if (sel.length) renderDetail(nodeIndex[sel[0]]);
+    });
+
+    network.on("deselectNode", () => {
+        document.getElementById("detail-panel").innerHTML =
+            '<p class="detail-placeholder">Click any node to see its memories.</p>';
+    });
+
+    document.getElementById("stat-nodes").textContent =
+        `${rawNodes.length} entit${rawNodes.length !== 1 ? "ies" : "y"}`;
+    document.getElementById("stat-edges").textContent =
+        `${rawEdges.length} relation${rawEdges.length !== 1 ? "s" : ""}`;
+    statusEl.textContent = rawNodes.length === 0 ? "No entities yet — add some memories first." : "";
+}
+
+loadGraph();
+</script>
+</body>
+</html>

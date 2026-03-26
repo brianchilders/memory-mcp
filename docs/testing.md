@@ -40,6 +40,8 @@ python -m pytest --tb=short
 | `tests/test_admin.py` | Admin UI smoke tests — route 200s, key HTML fragments present |
 | `tests/test_api_sessions.py` | Episodic memory + extraction HTTP endpoints — open/log/close/get_session, extract_and_remember, role validation, offline mock_llm fixture |
 | `tests/test_voice_routes.py` | Voice identity routes — GET /voices/unknown, enroll, merge (including voiceprint math), update_print, self-merge guard, NaN/Infinity rejection |
+| `tests/test_graph.py` | Graph endpoints — GET /graph HTML page, GET /api/graph nodes/edges structure, memory_count, inline memories, active-only edge filter (valid_until), auth exemption |
+| `tests/test_markdown_export.py` | Markdown export — single entity (frontmatter, heading, observations, wikilinks, 404), bulk export (JSON files dict), inactive relation exclusion, auth exemption |
 
 ## Fixture design
 
