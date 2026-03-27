@@ -1,0 +1,33 @@
+name: Tweet on Release
+
+on:
+  release:
+    types: [published]  # fires when a release is published
+
+jobs:
+  tweet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install tweepy
+
+      - name: Send tweet
+        env:
+          # pull secrets from GitHub repo settings
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          # GitHub auto-provides these on release events
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          REPO_NAME: ${{ github.repository }}
+        run: python .github/scripts/tweet_release.py
