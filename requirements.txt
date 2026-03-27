@@ -1,13 +1,46 @@
-# Runtime
-mcp>=1.0              # MCP stdio transport API stable since 1.x
-sqlite-vec>=0.1.6     # vec_distance_cosine() and virtual table support
-httpx>=0.27.0         # async client used for Ollama/OpenAI calls
-fastapi>=0.110.0      # lifespan context manager, BaseHTTPMiddleware
-uvicorn>=0.30.0       # ASGI server
-jinja2>=3.1.0         # template rendering for admin UI
-python-dotenv>=1.0.0  # .env loading
+# memory-mcp dependencies — fully pinned for supply chain lockdown.
+# To upgrade: test the new version, verify behaviour, then update the pin here.
+# Do NOT use >= specifiers — they allow compromised releases to land automatically.
 
-# Test
-pytest>=8.0
-pytest-asyncio>=0.21  # asyncio_mode=auto introduced in 0.21
-pytest-httpx>=0.30.0  # async httpx test client
+# ── Direct runtime dependencies ────────────────────────────────────────────────
+mcp==1.26.0              # MCP stdio transport API
+sqlite-vec==0.1.7        # vec_distance_cosine() and virtual table support
+httpx==0.28.1            # async client used for Ollama/OpenAI calls
+fastapi==0.135.1         # lifespan context manager, BaseHTTPMiddleware
+uvicorn==0.42.0          # ASGI server
+jinja2==3.1.2            # template rendering for admin UI
+python-dotenv==1.2.2     # .env loading
+
+# ── Transitive runtime dependencies ───────────────────────────────────────────
+# Pinned explicitly so a compromised release cannot reach us via a dependency upgrade.
+starlette==0.52.1        # FastAPI core
+pydantic==2.12.5         # FastAPI request/response models
+pydantic-core==2.41.5    # pydantic low-level core (Rust extension)
+pydantic-settings==2.13.1 # mcp settings support
+annotated-types==0.7.0   # pydantic typing support
+anyio==4.12.1            # async I/O — underpins httpx and starlette
+httpcore==1.0.9          # httpx transport layer
+h11==0.16.0              # HTTP/1.1 — used by httpcore and uvicorn
+httpx-sse==0.4.3         # server-sent events — mcp dependency
+sse-starlette==3.3.3     # SSE support for MCP server
+python-multipart==0.0.22 # form data parsing — starlette/fastapi
+click==8.1.6             # CLI — uvicorn dependency
+rich==13.7.1             # terminal output — mcp dependency
+markdown-it-py==3.0.0    # Markdown parser — rich dependency
+mdurl==0.1.2             # URL handling — markdown-it-py dependency
+pygments==2.17.2         # syntax highlighting — rich and pytest
+markupsafe==2.1.5        # HTML escaping — jinja2 dependency
+certifi==2023.11.17      # TLS root certificates — httpx/httpcore
+idna==3.6                # Internationalized domain names — httpx
+typing-extensions==4.15.0 # typing backports — pydantic, anyio, others
+typing-inspection==0.4.2 # runtime type inspection — pydantic-settings
+
+# ── Direct test dependencies ────────────────────────────────────────────────────
+pytest==9.0.2
+pytest-asyncio==1.3.0    # asyncio_mode=auto
+pytest-httpx==0.36.0     # async httpx test client
+
+# ── Transitive test dependencies ───────────────────────────────────────────────
+iniconfig==2.3.0         # pytest config file parsing
+packaging==26.0          # pytest version handling
+pluggy==1.6.0            # pytest plugin system
