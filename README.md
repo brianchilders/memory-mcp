@@ -2,13 +2,16 @@
 
 Unified semantic memory + time-series intelligence layer for OpenHome abilities.
 
-## Architecture: four tiers
+## Architecture: memory tiers
 
 ```
-Tier 1   — Semantic memory      entities, memories, relations, vectors
-Tier 1.5 — Episodic memory      conversation sessions, turn-by-turn transcripts
-Tier 2   — Time-series store    readings (numeric/categorical/composite), rollups, schedule
-Tier 3   — Pattern engine       background task: promotes stable trends → Tier 1 memories
+Tier 1    — Semantic memory       entities, memories, relations, vectors
+Tier 1.5  — Episodic memory       conversation sessions, turn-by-turn transcripts
+Tier 1.75 — Working memory        short-lived task scratchpads, promote-on-close
+Tier 2    — Time-series store     readings (numeric/categorical/composite), rollups, schedule
+Tier 3    — Pattern engine        background task: promotes stable trends → Tier 1 memories
+Tier 4    — Prospective memory    intentions: trigger_text → action_text, checked on each turn
+Tier 5    — Spatial memory        last-known object locations with confidence decay
 ```
 
 The pattern engine closes the loop: raw sensor data (Tier 2) automatically becomes
@@ -57,7 +60,7 @@ that any ability can recall semantically (Tier 1).
 
 ```bash
 # Install deps
-pip install mcp sqlite-vec httpx fastapi uvicorn jinja2
+pip install -r requirements.txt
 
 # Pull embedding and LLM models (Ollama default)
 ollama pull nomic-embed-text
@@ -91,7 +94,15 @@ export MEMORY_EMBED_DIM=1536
 export MEMORY_LLM_MODEL=gpt-4o-mini
 ```
 
-See `docs/ai-backend.md` for full configuration guide and provider examples.
+Split backends are supported — embed and LLM can run on different hosts:
+
+```bash
+# nomic-embed-text on a Raspberry Pi 4, LLM on a GPU machine
+export MEMORY_AI_BASE_URL=http://pi4.local:11434/v1
+export MEMORY_LLM_BASE_URL=http://gpu-host.local:11434/v1
+```
+
+See `docs/ai-backend.md` for full configuration guide, provider examples, and split backend setup.
 
 ## Source trust tiers
 
@@ -440,7 +451,10 @@ result = await mem.tool_cross_query("who in the house prefers a cooler environme
 ## Swapping embedding models
 
 ```bash
-# 1. Update EMBED_MODEL and EMBED_DIM in server.py
+# 1. Set the new model and dimension via env vars
+export MEMORY_EMBED_MODEL=mxbai-embed-large
+export MEMORY_EMBED_DIM=1024
+
 # 2. Pull the new model
 ollama pull mxbai-embed-large   # 1024-dim — richer but slower
 
