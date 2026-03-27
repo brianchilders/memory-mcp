@@ -2,30 +2,29 @@ name: Tweet on Release
 
 on:
   release:
-    types: [published]  # fires when a release is published
+    types: [published]
 
 jobs:
   tweet:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # opt into Node 24 now
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5        # updated from v4
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6    # updated from v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: pip install tweepy
 
       - name: Send tweet
         env:
-          # pull secrets from GitHub repo settings
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
-          # GitHub auto-provides these on release events
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_NAME: ${{ github.event.release.name }}
           RELEASE_URL: ${{ github.event.release.html_url }}
